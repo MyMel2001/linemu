@@ -48,4 +48,4 @@ go run main.go
 
 ## License
 
-Licensed under SPL-R5 (Custom license).
+Licensed under SPL-R5.
