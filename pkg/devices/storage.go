@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"linemu/pkg/pci"
+	"os"
 	"sync"
 )
 
@@ -22,6 +23,7 @@ type BlockStorage interface {
 	TotalSectors() uint64
 }
 
+// MemoryBlockDevice is an in-memory block storage
 type MemoryBlockDevice struct {
 	mu      sync.RWMutex
 	data    []byte
@@ -59,19 +61,91 @@ func (m *MemoryBlockDevice) TotalSectors() uint64 {
 	return m.sectors
 }
 
-// StorageController manages IDE/ATA & AHCI with Bus Master DMA
+// FileBlockDevice provides image file persistence (ISO, IMG, raw virtual disk)
+type FileBlockDevice struct {
+	mu      sync.RWMutex
+	file    *os.File
+	sectors uint64
+}
+
+func OpenFileBlockDevice(path string, readOnly bool) (*FileBlockDevice, error) {
+	flags := os.O_RDWR
+	if readOnly {
+		flags = os.O_RDONLY
+	}
+	f, err := os.OpenFile(path, flags, 0644)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &FileBlockDevice{
+		file:    f,
+		sectors: uint64(info.Size() / 512),
+	}, nil
+}
+
+func CreateVirtualDiskImage(path string, sizeMB int64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Truncate(sizeMB * 1024 * 1024)
+}
+
+func (f *FileBlockDevice) ReadSector(lba uint64, buf []byte) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if lba >= f.sectors || len(buf) < 512 {
+		return fmt.Errorf("read out of bounds: lba=%d", lba)
+	}
+	_, err := f.file.ReadAt(buf[:512], int64(lba*512))
+	return err
+}
+
+func (f *FileBlockDevice) WriteSector(lba uint64, buf []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if lba >= f.sectors || len(buf) < 512 {
+		return fmt.Errorf("write out of bounds: lba=%d", lba)
+	}
+	_, err := f.file.WriteAt(buf[:512], int64(lba*512))
+	return err
+}
+
+func (f *FileBlockDevice) TotalSectors() uint64 {
+	return f.sectors
+}
+
+func (f *FileBlockDevice) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.file.Close()
+}
+
+type DriveInfo struct {
+	UniqueID string
+	Type     DriveType
+	Storage  BlockStorage
+	Model    string
+	Serial   string
+}
+
+// StorageController manages IDE/ATA & AHCI with unique device identifiers
 type StorageController struct {
 	pci.BasePCIDevice
 	mu         sync.Mutex
 	basePort   uint16
-	drives     map[int]BlockStorage
-	types      map[int]DriveType
+	drives     map[int]*DriveInfo
 	curDrive   int
 	curLBA     uint64
 	curSecCnt  uint8
 	buf        [512]byte
 	bufIdx     int
-	// Bus Master IDE registers (8 bytes per channel)
 	bmCmd      uint8
 	bmStatus   uint8
 	bmPRDTable uint32
@@ -79,22 +153,33 @@ type StorageController struct {
 
 func NewStorageController(basePort uint16) *StorageController {
 	s := &StorageController{
-		BasePCIDevice: *pci.NewBasePCIDevice(0x8086, 0x7010, 0x0101, 0x00), // Intel PIIX3 IDE / ATA controller
+		BasePCIDevice: *pci.NewBasePCIDevice(0x8086, 0x7010, 0x0101, 0x00),
 		basePort:      basePort,
-		drives:        make(map[int]BlockStorage),
-		types:         make(map[int]DriveType),
+		drives:        make(map[int]*DriveInfo),
 	}
-	s.BARSizes[0] = 0x08   // Primary IDE
-	s.BARSizes[1] = 0x04   // Primary Control
-	s.BARSizes[4] = 0x10   // Bus Master I/O
+	s.BARSizes[0] = 0x08
+	s.BARSizes[1] = 0x04
+	s.BARSizes[4] = 0x10
 	return s
 }
 
-func (s *StorageController) Attach(driveID int, dType DriveType, storage BlockStorage) {
+func (s *StorageController) Attach(driveID int, uniqueID string, dType DriveType, storage BlockStorage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.drives[driveID] = storage
-	s.types[driveID] = dType
+	s.drives[driveID] = &DriveInfo{
+		UniqueID: uniqueID,
+		Type:     dType,
+		Storage:  storage,
+		Model:    fmt.Sprintf("LINEMU DRIVE %s", uniqueID),
+		Serial:   fmt.Sprintf("SN-%s", uniqueID),
+	}
+}
+
+func (s *StorageController) GetDriveInfo(driveID int) (*DriveInfo, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info, ok := s.drives[driveID]
+	return info, ok
 }
 
 func (s *StorageController) Read(port uint16, size int) (uint32, error) {
@@ -102,7 +187,6 @@ func (s *StorageController) Read(port uint16, size int) (uint32, error) {
 	defer s.mu.Unlock()
 	offset := port - s.basePort
 
-	// Bus Master DMA registers (Offset 0x08 - 0x0F)
 	if offset >= 0x08 && offset <= 0x0F {
 		switch offset - 0x08 {
 		case 0:
@@ -115,9 +199,8 @@ func (s *StorageController) Read(port uint16, size int) (uint32, error) {
 		return 0, nil
 	}
 
-	// Legacy IDE Task File (0x00 - 0x07)
 	switch offset {
-	case 0: // Data port (0x1F0)
+	case 0:
 		if s.bufIdx < 512 {
 			val := uint32(s.buf[s.bufIdx])
 			s.bufIdx++
@@ -128,10 +211,10 @@ func (s *StorageController) Read(port uint16, size int) (uint32, error) {
 			return val, nil
 		}
 		return 0, nil
-	case 7: // Status port (0x1F7)
-		status := uint32(0x40) // DRDY
+	case 7:
+		status := uint32(0x40)
 		if s.bufIdx < 512 {
-			status |= 0x08 // DRQ
+			status |= 0x08
 		}
 		return status, nil
 	default:
@@ -144,13 +227,12 @@ func (s *StorageController) Write(port uint16, val uint32, size int) error {
 	defer s.mu.Unlock()
 	offset := port - s.basePort
 
-	// Bus Master DMA write
 	if offset >= 0x08 && offset <= 0x0F {
 		switch offset - 0x08 {
 		case 0:
 			s.bmCmd = uint8(val)
 			if (s.bmCmd & 1) != 0 {
-				s.bmStatus |= 0x01 // Active DMA transfer
+				s.bmStatus |= 0x01
 			} else {
 				s.bmStatus &= ^uint8(0x01)
 			}
@@ -162,9 +244,8 @@ func (s *StorageController) Write(port uint16, val uint32, size int) error {
 		return nil
 	}
 
-	// Legacy IDE registers
 	switch offset {
-	case 0: // Data Port write
+	case 0:
 		if s.bufIdx < 512 {
 			s.buf[s.bufIdx] = byte(val)
 			s.bufIdx++
@@ -175,56 +256,64 @@ func (s *StorageController) Write(port uint16, val uint32, size int) error {
 		}
 		if s.bufIdx >= 512 {
 			if drv, ok := s.drives[s.curDrive]; ok {
-				_ = drv.WriteSector(s.curLBA, s.buf[:])
+				_ = drv.Storage.WriteSector(s.curLBA, s.buf[:])
 			}
 		}
-	case 2: // Sector count
+	case 2:
 		s.curSecCnt = uint8(val)
-	case 3: // LBA 0-7
+	case 3:
 		s.curLBA = (s.curLBA & ^uint64(0xFF)) | uint64(val&0xFF)
-	case 4: // LBA 8-15
+	case 4:
 		s.curLBA = (s.curLBA & ^uint64(0xFF00)) | (uint64(val&0xFF) << 8)
-	case 5: // LBA 16-23
+	case 5:
 		s.curLBA = (s.curLBA & ^uint64(0xFF0000)) | (uint64(val&0xFF) << 16)
-	case 6: // Drive select / LBA 24-27
+	case 6:
 		s.curDrive = int((val >> 4) & 1)
 		s.curLBA = (s.curLBA & ^uint64(0xF000000)) | (uint64(val&0x0F) << 24)
-	case 7: // Command port
+	case 7:
 		switch uint8(val) {
-		case 0x20: // READ SECTORS (PIO)
+		case 0x20:
 			if drv, ok := s.drives[s.curDrive]; ok {
-				_ = drv.ReadSector(s.curLBA, s.buf[:])
+				_ = drv.Storage.ReadSector(s.curLBA, s.buf[:])
 				s.bufIdx = 0
 			}
-		case 0x30: // WRITE SECTORS (PIO)
+		case 0x30:
 			s.bufIdx = 0
-		case 0xC8, 0xCA: // READ DMA / WRITE DMA
+		case 0xC8, 0xCA:
 			if drv, ok := s.drives[s.curDrive]; ok {
-				_ = drv.ReadSector(s.curLBA, s.buf[:])
-				s.bmStatus |= 0x04 // DMA Interrupt pending
+				_ = drv.Storage.ReadSector(s.curLBA, s.buf[:])
+				s.bmStatus |= 0x04
 			}
-		case 0xEC: // IDENTIFY DEVICE
-			s.generateIdentifyData()
+		case 0xEC:
+			s.generateIdentifyData(s.curDrive)
 			s.bufIdx = 0
 		}
 	}
 	return nil
 }
 
-func (s *StorageController) generateIdentifyData() {
+func (s *StorageController) generateIdentifyData(driveID int) {
 	var identify [512]byte
-	// General configuration
-	binary.LittleEndian.PutUint16(identify[0:], 0x0040) // Fixed disk
-	binary.LittleEndian.PutUint16(identify[2:], 16383)  // Cylinders
-	binary.LittleEndian.PutUint16(identify[6:], 16)     // Heads
-	binary.LittleEndian.PutUint16(identify[12:], 63)    // Sectors per track
-	// Serial number
-	copy(identify[20:40], "LINEMU_VIRTUAL_DISK ")
-	// Model number
-	copy(identify[54:94], "LINEMU HARDDISK CONTROLLER              ")
-	// Capabilities: LBA and DMA support
+	binary.LittleEndian.PutUint16(identify[0:], 0x0040)
+	binary.LittleEndian.PutUint16(identify[2:], 16383)
+	binary.LittleEndian.PutUint16(identify[6:], 16)
+	binary.LittleEndian.PutUint16(identify[12:], 63)
+
+	serial := "LINEMU_DISK_000000  "
+	model := "LINEMU HARDDISK CONTROLLER              "
+	if drv, ok := s.drives[driveID]; ok {
+		if len(drv.Serial) > 0 {
+			copy(identify[20:40], fmt.Sprintf("%-20s", drv.Serial))
+		}
+		if len(drv.Model) > 0 {
+			copy(identify[54:94], fmt.Sprintf("%-40s", drv.Model))
+		}
+	} else {
+		copy(identify[20:40], serial)
+		copy(identify[54:94], model)
+	}
+
 	binary.LittleEndian.PutUint16(identify[98:], 0x0300)
-	// Total sectors 28-bit LBA
 	binary.LittleEndian.PutUint32(identify[120:], 268435455)
 	copy(s.buf[:], identify[:])
 }
