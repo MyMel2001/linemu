@@ -26,24 +26,79 @@ type KernelDRMBridge struct {
 	ActiveAPI    GraphicsAPI
 	CommandRing  []uint32
 	KernelDevice string
+	Framebuffer  []byte
+	Renderer     *DisplayRenderer
+	Input        InputDevice
 }
 
 func NewKernelDRMBridge() *KernelDRMBridge {
+	w := uint32(1920)
+	h := uint32(1080)
+	fbSize := w * h * 4
+
 	k := &KernelDRMBridge{
 		BasePCIDevice: *pci.NewBasePCIDevice(0x1B36, 0x0100, 0x0300, 0x01), // Red Hat / QXL / VirtIO GPU
-		Width:         1920,
-		Height:        1080,
+		Width:         w,
+		Height:        h,
 		BPP:           32,
-		Pitch:         1920 * 4,
+		Pitch:         w * 4,
 		FBAddress:     0xE0000000,
 		ActiveAPI:     APIVulkan,
 		KernelDevice:  "/dev/dri/card0",
 		CommandRing:   make([]uint32, 0),
+		Framebuffer:   make([]byte, fbSize),
+		Renderer:      NewDisplayRenderer(DisplayWindow, w, h),
 	}
 	k.BARSizes[0] = 0x4000000 // 64MB Framebuffer
 	k.BARSizes[1] = 0x2000000 // 32MB Command / Surface RAM
 	k.BARSizes[2] = 0x2000    // 8KB MMIO / I/O space
 	return k
+}
+
+func (k *KernelDRMBridge) AttachRenderer(renderer *DisplayRenderer) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.Renderer = renderer
+	if renderer != nil && k.Input != nil {
+		renderer.AttachInput(k.Input)
+	}
+}
+
+func (k *KernelDRMBridge) AttachInput(input InputDevice) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.Input = input
+	if k.Renderer != nil {
+		k.Renderer.AttachInput(input)
+	}
+}
+
+// WritePixel updates a pixel at (x, y) with color in BGRA format
+func (k *KernelDRMBridge) WritePixel(x, y uint32, b, g, r, a uint8) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if x >= k.Width || y >= k.Height {
+		return
+	}
+	offset := (y*k.Width + x) * 4
+	if offset+3 < uint32(len(k.Framebuffer)) {
+		k.Framebuffer[offset] = b
+		k.Framebuffer[offset+1] = g
+		k.Framebuffer[offset+2] = r
+		k.Framebuffer[offset+3] = a
+	}
+}
+
+// Flush presents current framebuffer to live onscreen display
+func (k *KernelDRMBridge) Flush() {
+	k.mu.Lock()
+	renderer := k.Renderer
+	fb := k.Framebuffer
+	k.mu.Unlock()
+
+	if renderer != nil {
+		renderer.PresentFrame(fb)
+	}
 }
 
 type SPICEProtocolMessage struct {
@@ -63,6 +118,11 @@ func (k *KernelDRMBridge) DispatchCommand(cmd uint32, args []uint32) error {
 			k.Width = args[0]
 			k.Height = args[1]
 			k.Pitch = k.Width * (k.BPP / 8)
+			k.Framebuffer = make([]byte, k.Width*k.Height*4)
+			if k.Renderer != nil {
+				k.Renderer.Width = k.Width
+				k.Renderer.Height = k.Height
+			}
 		}
 	case 0x02: // Bind host hardware API (DirectX 12 / Vulkan / OpenGL)
 		if len(args) >= 1 {
@@ -70,6 +130,22 @@ func (k *KernelDRMBridge) DispatchCommand(cmd uint32, args []uint32) error {
 		}
 	case 0x03: // Submit command buffer directly to host kernel driver
 		k.CommandRing = append(k.CommandRing, args...)
+	case 0x04: // Flush / Swap buffers to screen
+		if k.Renderer != nil {
+			k.Renderer.PresentFrame(k.Framebuffer)
+		}
+	case 0x05: // Mouse input event (args: [dx, dy, buttons])
+		if k.Input != nil && len(args) >= 3 {
+			k.Input.SendMouseEvent(int(int32(args[0])), int(int32(args[1])), uint8(args[2]))
+		}
+	case 0x06: // Keyboard input event (args: [scancode, pressed])
+		if k.Input != nil && len(args) >= 1 {
+			if len(args) > 1 && args[1] == 0 {
+				k.Input.SendScancode(uint8(args[0]) | 0x80)
+			} else {
+				k.Input.SendScancode(uint8(args[0]))
+			}
+		}
 	default:
 		return fmt.Errorf("unknown graphics command: 0x%x", cmd)
 	}

@@ -13,10 +13,13 @@ import (
 	"linemu/pkg/pci"
 	"linemu/pkg/syscalls"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 )
 
 type VM struct {
-	CPU        *cpu.CPUState
+	CPUs       []*cpu.CPUState
 	MMU        *mmu.RAM
 	IO         *bus.IOBus
 	PCI        *pci.PCIBus
@@ -25,8 +28,18 @@ type VM struct {
 	HDA        *devices.IntelHDA
 	Storage    *devices.StorageController
 	DRM        *graphics.KernelDRMBridge
+	PS2        *devices.PS2Controller
 	Syscalls   *syscalls.SyscallHandler
 	UseJIT     bool
+	NumCores   int
+}
+
+// CPU returns the primary bootstrap CPU (vCPU 0)
+func (v *VM) CPU() *cpu.CPUState {
+	if len(v.CPUs) > 0 {
+		return v.CPUs[0]
+	}
+	return nil
 }
 
 func generateDriveUUID() string {
@@ -35,9 +48,45 @@ func generateDriveUUID() string {
 	return fmt.Sprintf("%X", b)
 }
 
-func NewVM(ramBytes uint64) *VM {
+func parseRAMSize(s string) (uint64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 64 * 1024 * 1024, nil
+	}
+
+	multiplier := uint64(1024 * 1024) // Default MB
+	numStr := s
+
+	if strings.HasSuffix(s, "G") || strings.HasSuffix(s, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		numStr = strings.TrimRight(s, "GB")
+	} else if strings.HasSuffix(s, "M") || strings.HasSuffix(s, "MB") {
+		multiplier = 1024 * 1024
+		numStr = strings.TrimRight(s, "MB")
+	} else if strings.HasSuffix(s, "K") || strings.HasSuffix(s, "KB") {
+		multiplier = 1024
+		numStr = strings.TrimRight(s, "KB")
+	}
+
+	val, err := strconv.ParseUint(strings.TrimSpace(numStr), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory string '%s': %w", s, err)
+	}
+	return val * multiplier, nil
+}
+
+func NewVM(ramBytes uint64, numCores int) *VM {
+	if numCores <= 0 {
+		numCores = 1
+	}
+
+	cpus := make([]*cpu.CPUState, numCores)
+	for i := 0; i < numCores; i++ {
+		cpus[i] = cpu.NewCPUState()
+	}
+
 	vm := &VM{
-		CPU:        cpu.NewCPUState(),
+		CPUs:       cpus,
 		MMU:        mmu.NewRAM(ramBytes),
 		IO:         bus.NewIOBus(),
 		PCI:        pci.NewPCIBus(),
@@ -46,9 +95,13 @@ func NewVM(ramBytes uint64) *VM {
 		HDA:        devices.NewIntelHDA(0x0400),
 		Storage:    devices.NewStorageController(0x01F0),
 		DRM:        graphics.NewKernelDRMBridge(),
+		PS2:        devices.NewPS2Controller(),
 		Syscalls:   syscalls.NewSyscallHandler(),
 		UseJIT:     true,
+		NumCores:   numCores,
 	}
+
+	vm.DRM.AttachInput(vm.PS2)
 
 	vm.PCI.AttachDevice(0, 1, 0, vm.Storage)
 	vm.PCI.AttachDevice(0, 2, 0, vm.NIC)
@@ -62,6 +115,9 @@ func NewVM(ramBytes uint64) *VM {
 	vm.IO.RegisterRange(0x0400, 0x100, vm.HDA)
 	vm.IO.RegisterRange(0x01F0, 0x10, vm.Storage)
 	vm.IO.RegisterRange(0x03C0, 0x20, vm.DRM)
+
+	vm.IO.Register(0x60, vm.PS2)
+	vm.IO.Register(0x64, vm.PS2)
 
 	return vm
 }
@@ -85,40 +141,56 @@ func (v *VM) BootFromSector(driveID int) error {
 	if err := info.Storage.ReadSector(0, bootSector[:]); err != nil {
 		return fmt.Errorf("failed to read boot sector: %w", err)
 	}
-	// Load boot sector into standard 0x7C00 x86 boot address
 	if err := v.MMU.LoadBytes(0x7C00, bootSector[:]); err != nil {
 		return err
 	}
-	v.CPU.RIP = 0x7C00
+	v.CPUs[0].RIP = 0x7C00
 	return nil
 }
 
-func (v *VM) Run(maxInstructions int) error {
-	for i := 0; i < maxInstructions && !v.CPU.Halted; i++ {
-		if v.UseJIT {
-			block, err := v.JIT.Compile(v.CPU.RIP, v.MMU)
-			if err == nil && len(block.Ops) > 0 {
-				errExec := block.Execute(v.CPU, v.MMU, v.IO)
-				if errExec == cpu.ErrSyscallTrapped {
-					if errSys := v.Syscalls.Handle(v.CPU, v.MMU); errSys != nil {
-						return errSys
-					}
-					continue
+func (v *VM) stepCPU(c *cpu.CPUState) error {
+	if v.UseJIT {
+		block, err := v.JIT.Compile(c.RIP, v.MMU)
+		if err == nil && len(block.Ops) > 0 {
+			errExec := block.Execute(c, v.MMU, v.IO)
+			if errExec == cpu.ErrSyscallTrapped {
+				if errSys := v.Syscalls.Handle(c, v.MMU); errSys != nil {
+					return errSys
 				}
-				if errExec != nil {
-					return errExec
-				}
-				continue
+				return nil
 			}
+			return errExec
 		}
+	}
 
-		err := v.CPU.Step(v.MMU, v.IO)
-		if err == cpu.ErrSyscallTrapped {
-			if errSys := v.Syscalls.Handle(v.CPU, v.MMU); errSys != nil {
-				return errSys
+	err := c.Step(v.MMU, v.IO)
+	if err == cpu.ErrSyscallTrapped {
+		return v.Syscalls.Handle(c, v.MMU)
+	}
+	return err
+}
+
+func (v *VM) Run(maxInstructions int) error {
+	var wg sync.WaitGroup
+	errs := make(chan error, len(v.CPUs))
+
+	for coreID := 0; coreID < len(v.CPUs); coreID++ {
+		wg.Add(1)
+		go func(c *cpu.CPUState) {
+			defer wg.Done()
+			for i := 0; i < maxInstructions && !c.Halted; i++ {
+				if err := v.stepCPU(c); err != nil {
+					errs <- err
+					return
+				}
 			}
-			continue
-		}
+		}(v.CPUs[coreID])
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
 		if err != nil {
 			return err
 		}
@@ -130,7 +202,16 @@ func main() {
 	isoPath := flag.String("iso", "", "Path to bootable ISO image")
 	imgPath := flag.String("img", "", "Path to virtual disk IMG file")
 	createHDD := flag.String("create-hdd", "", "Create new virtual HDD image (format: path,size_in_mb e.g. disk.img,1024)")
+	displayMode := flag.String("display", "window", "Graphics display mode: 'window' (real onscreen window), 'terminal' (ANSI 24-bit color), 'none' (headless)")
+	ramStr := flag.String("m", "64M", "Custom guest RAM size (e.g. 512M, 2G, 4GB)")
+	cores := flag.Int("smp", 1, "Number of vCPU cores")
 	flag.Parse()
+
+	ramBytes, err := parseRAMSize(*ramStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *createHDD != "" {
 		var path string
@@ -149,7 +230,7 @@ func main() {
 		}
 	}
 
-	vm := NewVM(64 * 1024 * 1024)
+	vm := NewVM(ramBytes, *cores)
 
 	slot := 0
 	if *imgPath != "" {
@@ -176,5 +257,18 @@ func main() {
 		}
 	}
 
-	fmt.Printf("LinEMU initialized successfully: 64MB RAM, PCI Host Bridge, JIT Compiler Ready.\n")
+	renderer := graphics.NewDisplayRenderer(graphics.DisplayMode(*displayMode), vm.DRM.Width, vm.DRM.Height)
+	renderer.AttachInput(vm.PS2)
+	if graphics.DisplayMode(*displayMode) != graphics.DisplayHeadless {
+		renderer.SetInputSource(os.Stdin)
+	}
+	vm.DRM.AttachRenderer(renderer)
+	if err := renderer.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not start display renderer (%v)\n", err)
+	} else {
+		fmt.Printf("Live graphics display active: mode=%s, resolution=%dx%d\n", *displayMode, vm.DRM.Width, vm.DRM.Height)
+		defer renderer.Stop()
+	}
+
+	fmt.Printf("LinEMU initialized successfully: %d MB RAM, %d vCPU core(s), PCI Host Bridge, JIT Ready.\n", ramBytes/(1024*1024), *cores)
 }

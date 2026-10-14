@@ -1,5 +1,4 @@
-# LinEMU
-
+# LinEmu
 x86_64 hardware translation emulator written in pure Go without external runtime dependencies or kernel patching.
 
 ## Features
@@ -12,6 +11,7 @@ x86_64 hardware translation emulator written in pure Go without external runtime
 - **Intel High Definition Audio (HDA)**: PCI audio controller supporting CORB/RIRB DMA buffers and integrated Realtek ALC888 codec verb responses.
 - **Storage Subsystem**: ATA/IDE task files, Bus Master DMA (PRD), and disk geometry reporting (`IDENTIFY DEVICE`) supporting HDD, CD/DVD, Floppy, and USB block devices.
 - **Host GPU Hardware Bridge**: SPICE / VirtIO / QXL display interface communicating directly with host graphics drivers (Vulkan, OpenGL, DirectX 12).
+- **PS/2 Keyboard & Mouse Subsystem**: i8042 controller on ports `0x60`/`0x64` with automatic input binding inherited by `-display`.
 - **System Call Translation**: Translates guest kernel syscall traps directly into standard Linux host kernel calls.
 
 ## Command Line Usage
@@ -30,6 +30,27 @@ go run main.go -iso=/path/to/installer.iso -img=my_disk.img
 ### 3. Boot directly from IMG virtual disk
 ```sh
 go run main.go -img=my_disk.img
+```
+
+### 4. Display options (Window vs Terminal vs Headless)
+```sh
+# Real onscreen window (uses active graphics stack / player window)
+go run main.go -img=my_disk.img -display=window
+
+# ANSI 24-bit TrueColor terminal graphics
+go run main.go -img=my_disk.img -display=terminal
+
+# Headless background execution
+go run main.go -img=my_disk.img -display=none
+```
+
+### 5. Custom RAM and Multi-core vCPU allocation
+```sh
+# Allocate 4GB RAM with 4 vCPU cores
+go run main.go -img=my_disk.img -m=4G -smp=4
+
+# Allocate 512MB RAM with 2 vCPU cores
+go run main.go -iso=installer.iso -m=512M -smp=2
 ```
 
 ## Building and Testing

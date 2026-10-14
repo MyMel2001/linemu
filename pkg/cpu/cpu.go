@@ -425,6 +425,16 @@ func (c *CPUState) Step(mem Memory, io IOBus) error {
 		}
 		return io.Out(uint16(port), uint32(c.Regs[RAX]), size)
 
+	case 0xEC: // IN AL, DX
+		c.RIP++
+		port := uint16(c.Regs[RDX] & 0xFFFF)
+		val, err := io.In(port, 1)
+		if err != nil {
+			return err
+		}
+		c.Regs[RAX] = (c.Regs[RAX] & ^uint64(0xFF)) | uint64(val&0xFF)
+		return nil
+
 	case 0xED: // IN EAX, DX
 		c.RIP++
 		port := uint16(c.Regs[RDX] & 0xFFFF)
@@ -434,6 +444,11 @@ func (c *CPUState) Step(mem Memory, io IOBus) error {
 		}
 		c.Regs[RAX] = uint64(val)
 		return nil
+
+	case 0xEE: // OUT DX, AL
+		c.RIP++
+		port := uint16(c.Regs[RDX] & 0xFFFF)
+		return io.Out(port, uint32(c.Regs[RAX]&0xFF), 1)
 
 	case 0xEF: // OUT DX, EAX
 		c.RIP++
