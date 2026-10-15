@@ -246,7 +246,7 @@ func (v *VM) stepCPU(c *cpu.CPUState) error {
 			errExec := block.Execute(c, v.MMU, v.IO)
 			if errExec == cpu.ErrSyscallTrapped {
 				if uefi.IsHypercall(c.Regs[cpu.RAX]) {
-					return uefi.HandleService(c, v.MMU)
+					return uefi.HandleServiceEx(c, v.MMU, v.PS2, v.DRM)
 				}
 				if errSys := v.Syscalls.Handle(c, v.MMU); errSys != nil {
 					return errSys
@@ -260,7 +260,7 @@ func (v *VM) stepCPU(c *cpu.CPUState) error {
 	err := c.Step(v.MMU, v.IO)
 	if err == cpu.ErrSyscallTrapped {
 		if uefi.IsHypercall(c.Regs[cpu.RAX]) {
-			return uefi.HandleService(c, v.MMU)
+			return uefi.HandleServiceEx(c, v.MMU, v.PS2, v.DRM)
 		}
 		return v.Syscalls.Handle(c, v.MMU)
 	}

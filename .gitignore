@@ -1,1 +1,3 @@
-./linemu
+linemu
+logs/
+*.log

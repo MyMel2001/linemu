@@ -976,7 +976,7 @@ func TestGOPBltBufferToVideo(t *testing.T) {
 	c := vm.CPU()
 	c.Regs[cpu.RAX] = 0xE0000000 + 12 // svcGopBlt
 	c.Regs[cpu.RDX] = 0x40000         // BltBuffer
-	c.Regs[cpu.R8] = 1                // BufferToVideo
+	c.Regs[cpu.R8] = 2                // BufferToVideo
 	c.Regs[cpu.R9] = 0                // SourceX
 	c.Regs[cpu.RSP] = 0x7FFFF0
 	stack := []struct {
@@ -1008,6 +1008,44 @@ func TestGOPBltBufferToVideo(t *testing.T) {
 	}
 	if fb[off+4] != 0x00 || fb[off+5] != 0xFF || fb[off+6] != 0x00 {
 		t.Fatalf("pixel1 = %02x %02x %02x, want 00 ff 00", fb[off+4], fb[off+5], fb[off+6])
+	}
+}
+
+func TestGOPBltFillVideo(t *testing.T) {
+	vm := NewVM(64*1024*1024, 1)
+	if err := uefi.SetupEFITables(vm.MMU, uefi.DefaultPayloadBase, 0xE0000000, 1920, 1080); err != nil {
+		t.Fatalf("SetupEFITables: %v", err)
+	}
+	red := []byte{0x00, 0x00, 0xFF, 0xFF} // BGRA red
+	if err := vm.MMU.LoadBytes(0x40000, red); err != nil {
+		t.Fatal(err)
+	}
+	c := vm.CPU()
+	c.Regs[cpu.RAX] = 0xE0000000 + 12 // svcGopBlt
+	c.Regs[cpu.RDX] = 0x40000         // fill color
+	c.Regs[cpu.R8] = 0                // VideoFill
+	c.Regs[cpu.R9] = 0                // SourceX unused
+	c.Regs[cpu.RSP] = 0x7FFFF0
+	for _, s := range []struct {
+		off uint64
+		val uint64
+	}{
+		{0x28, 0}, {0x30, 5}, {0x38, 5}, {0x40, 2}, {0x48, 1}, {0x50, 0},
+	} {
+		if err := vm.MMU.Write64(0x7FFFF0+s.off, s.val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := uefi.HandleService(c, vm.MMU); err != nil {
+		t.Fatalf("HandleService: %v", err)
+	}
+	if got := c.Regs[cpu.RAX]; got != 0 {
+		t.Fatalf("status = 0x%x", got)
+	}
+	off := (5*1920 + 5) * 4
+	fb := vm.DRM.Framebuffer
+	if fb[off] != 0x00 || fb[off+1] != 0x00 || fb[off+2] != 0xFF {
+		t.Fatalf("fill = %02x %02x %02x, want 00 00 ff", fb[off], fb[off+1], fb[off+2])
 	}
 }
 
@@ -1079,7 +1117,7 @@ func TestGOPQueryModeGuestStub(t *testing.T) {
 	if v, _ := vm.MMU.Read64(sizeOut); v != 36 {
 		t.Fatalf("SizeOfInfo = %d, want 36", v)
 	}
-	if v, _ := vm.MMU.Read64(infoOut); v != uefi.GOPInfoAddr {
-		t.Fatalf("Info = 0x%x, want 0x%x", v, uefi.GOPInfoAddr)
+	if v, _ := vm.MMU.Read64(infoOut); v != uefi.GOPModeInfoBase {
+		t.Fatalf("Info = 0x%x, want 0x%x", v, uefi.GOPModeInfoBase)
 	}
 }

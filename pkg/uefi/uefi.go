@@ -132,12 +132,16 @@ func SetupEFITables(ram *mmu.RAM, payloadBase uint64, fbBase uint64, fbWidth, fb
 	}
 
 	// 6. Loaded Image Protocol at LoadedImageBaseAddr
-	_ = ram.Write32(LoadedImageBaseAddr, 0x00010000)             // Revision
-	_ = ram.Write64(LoadedImageBaseAddr+32, payloadBase)         // ImageBase
-	_ = ram.Write64(LoadedImageBaseAddr+40, 1024*1024)          // ImageSize dummy
+	_ = ram.Write32(LoadedImageBaseAddr, 0x00010000)     // Revision
+	_ = ram.Write64(LoadedImageBaseAddr+32, payloadBase) // ImageBase
+	_ = ram.Write64(LoadedImageBaseAddr+40, 1024*1024)   // ImageSize dummy
 
 	// 7. Point protocol-dispatch services and ConOut members at hypercall stubs
 	SetupProtocolOverrides(ram)
+
+	// 8. Reset host-side firmware state last so GOP mode table + boot
+	// services stubs above stay intact; only allocator/map-key cells init.
+	ResetFirmwareState(ram)
 
 	return nil
 }

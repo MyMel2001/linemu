@@ -280,6 +280,32 @@ func (p *PS2Controller) SendScancode(code uint8) {
 	p.pushOutput(code, false)
 }
 
+// PeekScancode returns the oldest pending keyboard byte without consuming it.
+func (p *PS2Controller) PeekScancode() (uint8, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, b := range p.outQueue {
+		if !b.isAux {
+			return b.val, true
+		}
+	}
+	return 0, false
+}
+
+// PollScancode consumes and returns the oldest pending keyboard byte.
+func (p *PS2Controller) PollScancode() (uint8, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, b := range p.outQueue {
+		if !b.isAux {
+			p.outQueue = append(p.outQueue[:i], p.outQueue[i+1:]...)
+			p.updateStatus()
+			return b.val, true
+		}
+	}
+	return 0, false
+}
+
 func (p *PS2Controller) KeyDown(scancode uint8) {
 	p.SendScancode(scancode)
 }

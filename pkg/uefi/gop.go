@@ -16,6 +16,7 @@ package uefi
 import (
 	"encoding/binary"
 	"linemu/pkg/cpu"
+	"linemu/pkg/devices"
 	"linemu/pkg/graphics"
 	"linemu/pkg/mmu"
 )
@@ -32,13 +33,18 @@ const (
 	LoadedImgGUIDAdr uint64 = 0x101520
 	StubBase         uint64 = 0x101600
 
-	GOPInfoSize = 36
+	GOPModeInfoBase uint64 = 0x101800 // 4 x 36B MODE_INFO entries (ends 0x101890)
+	BootScratchBase uint64 = 0x102000 // 32 x 16B sequential stubs (ends 0x102200)
+	RtScratchBase   uint64 = 0x102300 // 16 x 16B sequential stubs (ends 0x102400)
+	ScratchBase     uint64 = 0x102000 // compat alias for boot scratch
+	GOPModeCount           = 4
+	GOPInfoSize            = 36
 
 	// SuccessStubAddr is the xor eax,eax; ret stub written by SetupEFITables
 	SuccessStubAddr = SystemTableBaseAddr + 0x80
 )
 
-// Stub slots at StubBase, 16 bytes each
+// Stub slots at StubBase, 16 bytes each. 32 slots cover all services.
 const (
 	stubHandleProtocol = StubBase + 0*16
 	stubOpenProtocol   = StubBase + 1*16
@@ -49,6 +55,29 @@ const (
 	stubOutputString   = StubBase + 6*16
 	stubClearScreen    = StubBase + 7*16
 	stubReadKeyStroke  = StubBase + 8*16
+	stubConInReset     = StubBase + 9*16
+	stubTestString     = StubBase + 10*16
+	stubConOutQuery    = StubBase + 11*16
+	stubConOutSetMode  = StubBase + 12*16
+	stubSetAttribute   = StubBase + 13*16
+	stubSetCursorPos   = StubBase + 14*16
+	stubEnableCursor   = StubBase + 15*16
+	stubConOutReset    = StubBase + 16*16
+	stubAllocPages     = StubBase + 17*16
+	stubFreePages      = StubBase + 18*16
+	stubGetMemoryMap   = StubBase + 19*16
+	stubAllocPool      = StubBase + 20*16
+	stubFreePool       = StubBase + 21*16
+	stubCreateEvent    = StubBase + 22*16
+	stubExitBoot       = StubBase + 23*16
+	stubStall          = StubBase + 24*16
+	stubCopyMem        = StubBase + 25*16
+	stubSetMem         = StubBase + 26*16
+	stubCrc32          = StubBase + 27*16
+	stubLocateHandle   = StubBase + 28*16
+	stubGetTime        = StubBase + 29*16
+	stubGetVariable    = StubBase + 30*16
+	stubSetVariable    = StubBase + 31*16
 )
 
 // Hypercall service ids (SYSCALL with RAX in this range)
@@ -66,14 +95,20 @@ const (
 
 // EFI_STATUS error codes
 const (
-	EFIStatusSuccess           uint64 = 0
-	EFIStatusInvalidParameter  uint64 = 0x8000000000000002
-	EFIStatusUnsupported       uint64 = 0x8000000000000003
-	EFIStatusNotFound          uint64 = 0x800000000000000E
+	EFIStatusSuccess          uint64 = 0
+	EFIStatusInvalidParameter uint64 = 0x8000000000000002
+	EFIStatusUnsupported      uint64 = 0x8000000000000003
+	EFIStatusNotFound         uint64 = 0x800000000000000E
 )
 
-// EFI_NOT_READY for ConIn.ReadKeyStroke
-var notReadyStub = []byte{0x48, 0xB8, 0x06, 0, 0, 0, 0, 0, 0, 0x80, 0xC3}
+// gopModes lists all video modes. Mode 0 is native so legacy guests and
+// existing tests see 1920x1080 without calling SetMode.
+var gopModes = [GOPModeCount][2]uint32{
+	{1920, 1080},
+	{1280, 720},
+	{1024, 768},
+	{800, 600},
+}
 
 // Protocol GUIDs in EFI_GUID memory layout (Data1/Data2/Data3 little-endian, Data4 raw)
 var (
@@ -98,18 +133,59 @@ func writeServiceStub(ram *mmu.RAM, addr, svc uint64) error {
 	return ram.LoadBytes(addr, code)
 }
 
+func writeModeInfo(ram *mmu.RAM, addr uint64, w, h uint32) {
+	_ = ram.Write32(addr+0, 0) // Version
+	_ = ram.Write32(addr+4, w)
+	_ = ram.Write32(addr+8, h)
+	_ = ram.Write32(addr+12, 1) // PixelFormat BGRX
+	_ = ram.Write32(addr+16, 0) // PixelInformation Rsvd
+	_ = ram.Write32(addr+20, 0)
+	_ = ram.Write32(addr+24, 0)
+	_ = ram.Write32(addr+28, 0)
+	_ = ram.Write32(addr+32, w) // PixelsPerScanLine
+}
+
 // SetupGOP installs the EFI_GRAPHICS_OUTPUT_PROTOCOL, ConIn, GUIDs and
 // hypercall stubs describing a linear framebuffer at fbBase.
 func SetupGOP(ram *mmu.RAM, fbBase uint64, fbWidth, fbHeight uint32) error {
-	stubs := []uint64{svcHandleProtocol, svcOpenProtocol, svcLocateProtocol,
-		svcGopQueryMode, svcGopSetMode, svcGopBlt, svcOutputString, svcClearScreen}
-	for i, svc := range stubs {
-		if err := writeServiceStub(ram, StubBase+uint64(i)*16, svc); err != nil {
+	stubs := map[uint64]uint64{
+		stubHandleProtocol: svcHandleProtocol,
+		stubOpenProtocol:   svcOpenProtocol,
+		stubLocateProtocol: svcLocateProtocol,
+		stubGopQueryMode:   svcGopQueryMode,
+		stubGopSetMode:     svcGopSetMode,
+		stubGopBlt:         svcGopBlt,
+		stubOutputString:   svcOutputString,
+		stubClearScreen:    svcClearScreen,
+		stubReadKeyStroke:  svcReadKeyStroke,
+		stubConInReset:     svcConInReset,
+		stubTestString:     svcTestString,
+		stubConOutQuery:    svcConOutQueryMode,
+		stubConOutSetMode:  svcConOutSetMode,
+		stubSetAttribute:   svcSetAttribute,
+		stubSetCursorPos:   svcSetCursorPosition,
+		stubEnableCursor:   svcEnableCursor,
+		stubConOutReset:    svcConOutReset,
+		stubAllocPages:     svcAllocatePages,
+		stubFreePages:      svcFreePages,
+		stubGetMemoryMap:   svcGetMemoryMap,
+		stubAllocPool:      svcAllocatePool,
+		stubFreePool:       svcFreePool,
+		stubCreateEvent:    svcCreateEvent,
+		stubExitBoot:       svcExitBootServices,
+		stubStall:          svcStall,
+		stubCopyMem:        svcCopyMem,
+		stubSetMem:         svcSetMem,
+		stubCrc32:          svcCrc32,
+		stubLocateHandle:   svcLocateHandle,
+		stubGetTime:        svcGetTime,
+		stubGetVariable:    svcGetVariable,
+		stubSetVariable:    svcSetVariable,
+	}
+	for addr, svc := range stubs {
+		if err := writeServiceStub(ram, addr, svc); err != nil {
 			return err
 		}
-	}
-	if err := ram.LoadBytes(stubReadKeyStroke, notReadyStub); err != nil {
-		return err
 	}
 
 	// EFI_GRAPHICS_OUTPUT_PROTOCOL { QueryMode*, SetMode*, Blt*, Mode* }
@@ -118,31 +194,33 @@ func SetupGOP(ram *mmu.RAM, fbBase uint64, fbWidth, fbHeight uint32) error {
 	_ = ram.Write64(GOPProtocolAddr+16, stubGopBlt)
 	_ = ram.Write64(GOPProtocolAddr+24, GOPModeAddr)
 
+	// Mode table: mode 0 tracks the host framebuffer size passed in.
+	gopModes[0][0], gopModes[0][1] = fbWidth, fbHeight
+	for i := 0; i < GOPModeCount; i++ {
+		writeModeInfo(ram, GOPModeInfoBase+uint64(i*GOPInfoSize), gopModes[i][0], gopModes[i][1])
+	}
 	// EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
-	_ = ram.Write32(GOPModeAddr+0, 1) // MaxMode
-	_ = ram.Write32(GOPModeAddr+4, 0) // Mode
+	_ = ram.Write32(GOPModeAddr+0, GOPModeCount) // MaxMode
+	_ = ram.Write32(GOPModeAddr+4, 0)            // Mode
 	_ = ram.Write64(GOPModeAddr+8, GOPInfoAddr)
 	_ = ram.Write64(GOPModeAddr+16, GOPInfoSize)
 	_ = ram.Write64(GOPModeAddr+24, fbBase)
 	_ = ram.Write64(GOPModeAddr+32, uint64(fbWidth)*uint64(fbHeight)*4)
+	writeModeInfo(ram, GOPInfoAddr, fbWidth, fbHeight)
 
-	// EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE_INFO
-	// PixelFormat 1 = PixelBlueGreenRedReserved8BitPerColor (byte0=blue),
-	// matching the DRM framebuffer byte order (b,g,r,a).
-	_ = ram.Write32(GOPInfoAddr+4, fbWidth)
-	_ = ram.Write32(GOPInfoAddr+8, fbHeight)
-	_ = ram.Write32(GOPInfoAddr+12, 1)
-	_ = ram.Write32(GOPInfoAddr+32, fbWidth) // PixelsPerScanLine
-
-	// EFI_SIMPLE_TEXT_OUTPUT_MODE at ConOutModeAddr
+	// EFI_SIMPLE_TEXT_OUTPUT_MODE { MaxMode, Mode, Attribute, CursorColumn, CursorRow, CursorVisible }
 	_ = ram.Write32(ConOutModeAddr+0, 1)  // MaxMode
+	_ = ram.Write32(ConOutModeAddr+4, 0)  // Mode
 	_ = ram.Write32(ConOutModeAddr+8, 7)  // Attribute (light grey on black)
+	_ = ram.Write32(ConOutModeAddr+12, 0) // CursorColumn
+	_ = ram.Write32(ConOutModeAddr+16, 0) // CursorRow
 	_ = ram.Write32(ConOutModeAddr+20, 1) // CursorVisible
 
-	// EFI_SIMPLE_TEXT_INPUT_PROTOCOL at ConInAddr
-	_ = ram.Write64(ConInAddr+0, SuccessStubAddr)         // Reset
-	_ = ram.Write64(ConInAddr+8, stubReadKeyStroke) // ReadKeyStroke -> EFI_NOT_READY
-	_ = ram.Write64(ConInAddr+16, SuccessStubAddr)         // WaitForKey
+	// EFI_SIMPLE_TEXT_INPUT_PROTOCOL { Reset*, ReadKeyStroke*, WaitForKey }
+	// WaitForKey is an event id (not code): guests pass it to WaitForEvent.
+	_ = ram.Write64(ConInAddr+0, stubConInReset)
+	_ = ram.Write64(ConInAddr+8, stubReadKeyStroke)
+	_ = ram.Write64(ConInAddr+16, EvtConInKey)
 
 	// Protocol GUIDs stored in guest RAM for HandleProtocol/LocateProtocol compares
 	for _, g := range []struct {
@@ -161,26 +239,148 @@ func SetupGOP(ram *mmu.RAM, fbBase uint64, fbWidth, fbHeight uint32) error {
 	return nil
 }
 
+// bootSvcStub maps a BootServices byte offset to its hypercall stub.
+// Kept for tests/docs; SetupProtocolOverrides is authoritative.
+func bootSvcStub(off uint64) uint64 {
+	switch off {
+	case 40:
+		return stubAllocPages
+	case 48:
+		return stubFreePages
+	case 56:
+		return stubGetMemoryMap
+	case 64:
+		return stubAllocPool
+	case 72:
+		return stubFreePool
+	case 152:
+		return stubHandleProtocol
+	case 280:
+		return stubOpenProtocol
+	case 320:
+		return stubLocateProtocol
+	case 344:
+		return stubCrc32
+	case 352:
+		return stubCopyMem
+	case 360:
+		return stubSetMem
+	case 368:
+		return stubCreateEvent
+	}
+	return 0
+}
+
 // SetupProtocolOverrides points protocol-dispatch boot services and ConOut
 // members at hypercall stubs. Call after SetupEFITables filled the tables.
+// Each table offset gets a dedicated 13B stub in scratch RAM; stubs are
+// allocated sequentially (16B spacing) so large offsets (e.g. 368) can never
+// collide with the GOP mode table or firmware cells.
 func SetupProtocolOverrides(ram *mmu.RAM) {
-	// EFI_BOOT_SERVICES offsets: HandleProtocol 152, OpenProtocol 280, LocateProtocol 320
-	_ = ram.Write64(BootServicesBaseAddr+152, stubHandleProtocol)
-	_ = ram.Write64(BootServicesBaseAddr+280, stubOpenProtocol)
-	_ = ram.Write64(BootServicesBaseAddr+320, stubLocateProtocol)
-
-	// EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL at ConOutBaseAddr: fill all members with
-	// success stub, then override OutputString (+8) and ClearScreen (+48).
-	for off := uint64(0); off < 64; off += 8 {
-		_ = ram.Write64(ConOutBaseAddr+off, SuccessStubAddr)
+	offToSvc := map[uint64]uint64{
+		24:  svcRaiseTPL,
+		32:  svcRestoreTPL,
+		80:  svcCreateEvent,
+		88:  svcSetTimer,
+		96:  svcWaitForEvent,
+		104: svcSignalEvent,
+		112: svcCloseEvent,
+		120: svcCheckEvent,
+		128: svcInstallProtocol,
+		136: svcReinstallProtocol,
+		144: svcUninstallProtocol,
+		152: svcHandleProtocol,
+		168: svcRegisterNotify,
+		176: svcLocateHandle,
+		192: svcInstallConfigTable,
+		216: svcExit,
+		232: svcExitBootServices,
+		240: svcGetNextMono,
+		248: svcStall,
+		264: svcConnectController,
+		272: svcDisconnectControl,
+		280: svcOpenProtocol,
+		288: svcCloseProtocol,
+		296: svcOpenProtocolInfo,
+		304: svcProtocolsPerHandle,
+		312: svcLocateHandleBuffer,
+		320: svcLocateProtocol,
+		328: svcInstallMultiple,
+		336: svcUninstallMultiple,
+		344: svcCrc32,
+		352: svcCopyMem,
+		360: svcSetMem,
+		368: svcCreateEventEx,
 	}
-	_ = ram.Write64(ConOutBaseAddr+8, stubOutputString)
-	_ = ram.Write64(ConOutBaseAddr+48, stubClearScreen)
-	_ = ram.Write64(ConOutBaseAddr+72, ConOutModeAddr) // Mode*
+	// Sort offsets for deterministic stub addresses (insertion sort: 32 entries).
+	offs := make([]uint64, 0, len(offToSvc))
+	for off := range offToSvc {
+		offs = append(offs, off)
+	}
+	for i := 1; i < len(offs); i++ {
+		for j := i; j > 0 && offs[j] < offs[j-1]; j-- {
+			offs[j], offs[j-1] = offs[j-1], offs[j]
+		}
+	}
+	for i, off := range offs {
+		addr := BootScratchBase + uint64(i*16)
+		_ = writeServiceStub(ram, addr, offToSvc[off])
+		_ = ram.Write64(BootServicesBaseAddr+off, addr)
+	}
+	// Direct boot-service entry points with fixed slots (ids already encoded):
+	_ = ram.Write64(BootServicesBaseAddr+40, stubAllocPages)
+	_ = ram.Write64(BootServicesBaseAddr+48, stubFreePages)
+	_ = ram.Write64(BootServicesBaseAddr+56, stubGetMemoryMap)
+	_ = ram.Write64(BootServicesBaseAddr+64, stubAllocPool)
+	_ = ram.Write64(BootServicesBaseAddr+72, stubFreePool)
+
+	// EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL members
+	_ = ram.Write64(ConOutBaseAddr+0, stubConOutReset)   // Reset
+	_ = ram.Write64(ConOutBaseAddr+8, stubOutputString) // OutputString
+	_ = ram.Write64(ConOutBaseAddr+16, stubTestString)   // TestString
+	_ = ram.Write64(ConOutBaseAddr+24, stubConOutQuery)  // QueryMode
+	_ = ram.Write64(ConOutBaseAddr+32, stubConOutSetMode) // SetMode
+	_ = ram.Write64(ConOutBaseAddr+40, stubSetAttribute) // SetAttribute
+	_ = ram.Write64(ConOutBaseAddr+48, stubClearScreen)  // ClearScreen
+	_ = ram.Write64(ConOutBaseAddr+56, stubSetCursorPos)  // SetCursorPosition
+	_ = ram.Write64(ConOutBaseAddr+64, stubEnableCursor)  // EnableCursor
+	_ = ram.Write64(ConOutBaseAddr+72, ConOutModeAddr)    // Mode*
+
+	// Runtime services used by guests
+	_ = ram.Write64(RuntimeServicesBaseAddr+24, stubGetTime)
+	_ = ram.Write64(RuntimeServicesBaseAddr+72, stubGetVariable)
+	_ = ram.Write64(RuntimeServicesBaseAddr+88, stubSetVariable)
+	rtOverride := map[uint64]uint64{
+		56: svcConOutReset, // SetVirtualAddressMap: success stub slot
+		80: svcGetNextVariableName,
+		96: svcGetNextHighMono,
+	}
+	rtOffs := make([]uint64, 0, len(rtOverride))
+	for off := range rtOverride {
+		rtOffs = append(rtOffs, off)
+	}
+	for i := 1; i < len(rtOffs); i++ {
+		for j := i; j > 0 && rtOffs[j] < rtOffs[j-1]; j-- {
+			rtOffs[j], rtOffs[j-1] = rtOffs[j-1], rtOffs[j]
+		}
+	}
+	for i, off := range rtOffs {
+		addr := RtScratchBase + uint64(i*16)
+		_ = writeServiceStub(ram, addr, rtOverride[off])
+		_ = ram.Write64(RuntimeServicesBaseAddr+off, addr)
+	}
 }
 
 // HandleService executes an EFI hypercall trapped from a guest stub.
 func HandleService(state *cpu.CPUState, ram *mmu.RAM) error {
+	return HandleServiceEx(state, ram, nil, nil)
+}
+
+// HandleServiceEx routes hypercalls with PS2 keyboard and DRM resize support.
+func HandleServiceEx(state *cpu.CPUState, ram *mmu.RAM, ps2 *devices.PS2Controller, drm *graphics.KernelDRMBridge) error {
+	if handled, err := DispatchServices(state, ram, ps2, drm); handled {
+		return err
+	}
 	switch state.Regs[cpu.RAX] {
 	case svcHandleProtocol, svcOpenProtocol:
 		// (Handle, Protocol*, Interface**) — GUID in RDX
@@ -191,12 +391,7 @@ func HandleService(state *cpu.CPUState, ram *mmu.RAM) error {
 	case svcGopQueryMode:
 		return gopQueryMode(state, ram)
 	case svcGopSetMode:
-		if state.Regs[cpu.RDX] != 0 {
-			state.Regs[cpu.RAX] = EFIStatusUnsupported
-			return nil
-		}
-		state.Regs[cpu.RAX] = EFIStatusSuccess
-		return nil
+		return gopSetMode(state, ram, drm)
 	case svcGopBlt:
 		return gopBlt(state, ram)
 	case svcOutputString:
@@ -210,14 +405,17 @@ func HandleService(state *cpu.CPUState, ram *mmu.RAM) error {
 }
 
 func guidDispatch(state *cpu.CPUState, ram *mmu.RAM, guidAddr, outAddr uint64) error {
-	var g [16]byte
-	for i := 0; i < 16; i++ {
-		b, err := ram.Read8(guidAddr + uint64(i))
-		if err != nil {
-			state.Regs[cpu.RAX] = EFIStatusInvalidParameter
-			return nil
+	g, err := readGUID(ram, guidAddr)
+	if err != nil {
+		state.Regs[cpu.RAX] = EFIStatusInvalidParameter
+		return nil
+	}
+	if iface, ok := locateAny(g); ok {
+		if outAddr != 0 {
+			_ = ram.Write64(outAddr, iface)
 		}
-		g[i] = b
+		state.Regs[cpu.RAX] = EFIStatusSuccess
+		return nil
 	}
 	var iface uint64
 	switch g {
@@ -241,7 +439,8 @@ func guidDispatch(state *cpu.CPUState, ram *mmu.RAM, guidAddr, outAddr uint64) e
 }
 
 func gopQueryMode(state *cpu.CPUState, ram *mmu.RAM) error {
-	if state.Regs[cpu.RDX] != 0 { // MaxMode = 1
+	mode := state.Regs[cpu.RDX]
+	if mode >= GOPModeCount {
 		state.Regs[cpu.RAX] = EFIStatusInvalidParameter
 		return nil
 	}
@@ -249,8 +448,32 @@ func gopQueryMode(state *cpu.CPUState, ram *mmu.RAM) error {
 		_ = ram.Write64(p, GOPInfoSize)
 	}
 	if p := state.Regs[cpu.R9]; p != 0 {
-		_ = ram.Write64(p, GOPInfoAddr)
+		_ = ram.Write64(p, GOPModeInfoBase+mode*GOPInfoSize)
 	}
+	state.Regs[cpu.RAX] = EFIStatusSuccess
+	return nil
+}
+
+// gopSetMode switches the logical mode. The physical framebuffer stays the
+// host 1920x1080 buffer; smaller modes render top-left. Clears screen.
+func gopSetMode(state *cpu.CPUState, ram *mmu.RAM, drm *graphics.KernelDRMBridge) error {
+	mode := state.Regs[cpu.RDX]
+	if mode >= GOPModeCount {
+		state.Regs[cpu.RAX] = EFIStatusUnsupported
+		return nil
+	}
+	w, h := gopModes[mode][0], gopModes[mode][1]
+	_ = ram.Write32(GOPModeAddr+4, uint32(mode))
+	_ = ram.Write64(GOPModeAddr+8, GOPModeInfoBase+mode*GOPInfoSize)
+	writeModeInfo(ram, GOPInfoAddr, w, h)
+	if fb, _, _, _, ok := fbInfo(ram); ok {
+		for i := range fb {
+			fb[i] = 0
+		}
+	}
+	_ = ram.Write32(ConOutModeAddr+12, 0)
+	_ = ram.Write32(ConOutModeAddr+16, 0)
+	_ = drm // physical resize deferred; logical mode only
 	state.Regs[cpu.RAX] = EFIStatusSuccess
 	return nil
 }
@@ -265,23 +488,24 @@ func fbInfo(ram *mmu.RAM) (fb []byte, fbW, fbH, pitch uint64, ok bool) {
 	if err != nil {
 		return
 	}
-	fbW, err = ram.Read64(GOPInfoAddr + 4)
+	fbW32, err := ram.Read32(GOPInfoAddr + 4)
 	if err != nil {
 		return
 	}
-	fbH, err = ram.Read64(GOPInfoAddr + 8)
+	fbH32, err := ram.Read32(GOPInfoAddr + 8)
 	if err != nil {
 		return
 	}
-	ppsl, err := ram.Read64(GOPInfoAddr + 32)
+	ppsl32, err := ram.Read32(GOPInfoAddr + 32)
 	if err != nil {
 		return
 	}
+	fbW, fbH = uint64(fbW32), uint64(fbH32)
+	pitch = uint64(ppsl32) * 4
 	fb, err = ram.RawBuffer(base, size)
 	if err != nil {
 		return
 	}
-	pitch = ppsl * 4
 	ok = true
 	return
 }
@@ -314,13 +538,23 @@ func gopBlt(state *cpu.CPUState, ram *mmu.RAM) error {
 	if stride == 0 {
 		stride = width * 4
 	}
-	rowBytes := width * 4
 
 	var buf []byte
-	if op != 2 { // VideoToVideo touches only the framebuffer
-		extent := (srcY+height)*stride + (srcX+width)*4
-		if e2 := (dstY+height)*stride + (dstX+width)*4; e2 > extent {
-			extent = e2
+	if op != 3 { // VideoToVideo touches only the framebuffer
+		// Per-op buffer extent. Spec ops: 0=VideoFill (1 pixel),
+		// 1=VideoToBuffer (dst in buffer), 2=BufferToVideo (src in buffer),
+		// 3=VideoToVideo (no buffer).
+		var extent uint64
+		switch op {
+		case 0:
+			extent = 4
+		case 1:
+			extent = (dstY+height)*stride + (dstX+width)*4
+		case 2:
+			extent = (srcY+height)*stride + (srcX+width)*4
+		default:
+			state.Regs[cpu.RAX] = EFIStatusInvalidParameter
+			return nil
 		}
 		var err error
 		buf, err = ram.RawBuffer(bufAddr, extent)
@@ -342,17 +576,28 @@ func gopBlt(state *cpu.CPUState, ram *mmu.RAM) error {
 	var tmp []byte
 
 	switch op {
-	case 0: // VideoToBuffer
+	case 0: // VideoFill: fill dst rect with buf[0:4] color
+		x, w := clip(dstX, width)
+		for row := uint64(0); row < height && dstY+row < fbH; row++ {
+			dstOff := (dstY+row)*pitch + x*4
+			if dstOff+w*4 > uint64(len(fb)) {
+				break
+			}
+			for i := uint64(0); i < w; i++ {
+				copy(fb[dstOff+i*4:dstOff+i*4+4], buf[:4])
+			}
+		}
+	case 1: // VideoToBuffer
 		x, w := clip(srcX, width)
 		for row := uint64(0); row < height && srcY+row < fbH; row++ {
-			srcOff := ((srcY+row)*pitch + x) * 4
+			srcOff := (srcY+row)*pitch + x*4
 			dstOff := (dstY+row)*stride + dstX*4
 			if dstOff+w*4 > uint64(len(buf)) || srcOff+w*4 > uint64(len(fb)) {
 				break
 			}
 			copy(buf[dstOff:dstOff+w*4], fb[srcOff:srcOff+w*4])
 		}
-	case 1: // BufferToVideo
+	case 2: // BufferToVideo
 		x, w := clip(dstX, width)
 		for row := uint64(0); row < height && dstY+row < fbH; row++ {
 			srcOff := (srcY+row)*stride + srcX*4
@@ -362,7 +607,7 @@ func gopBlt(state *cpu.CPUState, ram *mmu.RAM) error {
 			}
 			copy(fb[dstOff:dstOff+w*4], buf[srcOff:srcOff+w*4])
 		}
-	case 2: // VideoToVideo (overlap-safe via per-row temp)
+	case 3: // VideoToVideo (overlap-safe via per-row temp)
 		x, w := clip(dstX, width)
 		tmp = make([]byte, w*4)
 		for row := uint64(0); row < height && dstY+row < fbH; row++ {
@@ -374,21 +619,32 @@ func gopBlt(state *cpu.CPUState, ram *mmu.RAM) error {
 			copy(tmp, fb[srcOff:srcOff+w*4])
 			copy(fb[dstOff:dstOff+w*4], tmp)
 		}
-	case 3: // BufferToBuffer (Go copy is overlap-safe)
-		for row := uint64(0); row < height; row++ {
-			srcOff := (srcY+row)*stride + srcX*4
-			dstOff := (dstY+row)*stride + dstX*4
-			if dstOff+rowBytes > uint64(len(buf)) || srcOff+rowBytes > uint64(len(buf)) {
-				break
-			}
-			copy(buf[dstOff:dstOff+rowBytes], buf[srcOff:srcOff+rowBytes])
-		}
 	default:
 		state.Regs[cpu.RAX] = EFIStatusInvalidParameter
 		return nil
 	}
 	state.Regs[cpu.RAX] = EFIStatusSuccess
 	return nil
+}
+
+// efiColors maps EFI text colors (0-15) to BGRA bytes.
+var efiColors = [16][4]byte{
+	{0x00, 0x00, 0x00, 0xFF}, // black
+	{0x80, 0x00, 0x00, 0xFF}, // blue
+	{0x00, 0x80, 0x00, 0xFF}, // green
+	{0x80, 0x80, 0x00, 0xFF}, // cyan
+	{0x00, 0x00, 0x80, 0xFF}, // red
+	{0x80, 0x00, 0x80, 0xFF}, // magenta
+	{0x00, 0x80, 0x80, 0xFF}, // brown
+	{0xC0, 0xC0, 0xC0, 0xFF}, // light gray
+	{0x80, 0x80, 0x80, 0xFF}, // dark gray
+	{0xFF, 0x00, 0x00, 0xFF}, // light blue
+	{0x00, 0xFF, 0x00, 0xFF}, // light green
+	{0xFF, 0xFF, 0x00, 0xFF}, // light cyan
+	{0x00, 0x00, 0xFF, 0xFF}, // light red
+	{0xFF, 0x00, 0xFF, 0xFF}, // light magenta
+	{0x00, 0xFF, 0xFF, 0xFF}, // yellow
+	{0xFF, 0xFF, 0xFF, 0xFF}, // white
 }
 
 // conOutOutputString renders a UCS-2 string into the GOP framebuffer, honoring
@@ -401,6 +657,9 @@ func conOutOutputString(state *cpu.CPUState, ram *mmu.RAM) error {
 		state.Regs[cpu.RAX] = EFIStatusSuccess // no console framebuffer: discard text
 		return nil
 	}
+	attr, _ := ram.Read32(ConOutModeAddr + 8)
+	fg := efiColors[attr&0x0F]
+	bg := efiColors[(attr>>4)&0x07] // bit7 = bright bit, not blink in text mode
 
 	const cellW, cellH = 16, 16 // 8x8 font at 2x scale
 	cols := int64(fbW) / cellW
@@ -436,7 +695,7 @@ func conOutOutputString(state *cpu.CPUState, ram *mmu.RAM) error {
 		if b >= 0x80 {
 			b = '?'
 		}
-		drawGlyph(fb, pitch, uint32(rCol*cellW), uint32(rRow*cellH), b)
+		drawGlyphColor(fb, pitch, uint32(rCol*cellW), uint32(rRow*cellH), b, fg, bg)
 		rCol++
 		if rCol >= cols {
 			rCol, rRow = 0, rRow+1
@@ -471,6 +730,11 @@ func conOutClearScreen(state *cpu.CPUState, ram *mmu.RAM) error {
 }
 
 func drawGlyph(fb []byte, pitch uint64, x, y uint32, ch byte) {
+	drawGlyphColor(fb, pitch, x, y, ch,
+		[4]byte{0xFF, 0xFF, 0xFF, 0xFF}, [4]byte{0x00, 0x00, 0x00, 0xFF})
+}
+
+func drawGlyphColor(fb []byte, pitch uint64, x, y uint32, ch byte, fg, bg [4]byte) {
 	glyph := graphics.Font8x8Glyph(ch)
 	if glyph == nil {
 		return
@@ -479,8 +743,12 @@ func drawGlyph(fb []byte, pitch uint64, x, y uint32, ch byte) {
 	for r := uint32(0); r < 8; r++ {
 		bits := glyph[r]
 		for c := uint32(0); c < 8; c++ {
-			if bits&(1<<c) == 0 {
-				continue
+			set := bits&(1<<c) != 0
+			var px [4]byte
+			if set {
+				px = fg
+			} else {
+				px = bg
 			}
 			for sy := uint32(0); sy < 2; sy++ {
 				off := (uint64(y)+uint64(r)*scale+uint64(sy))*pitch + (uint64(x)+uint64(c)*scale)*4
@@ -489,10 +757,10 @@ func drawGlyph(fb []byte, pitch uint64, x, y uint32, ch byte) {
 					if p+3 >= uint64(len(fb)) {
 						return
 					}
-					fb[p] = 0xFF
-					fb[p+1] = 0xFF
-					fb[p+2] = 0xFF
-					fb[p+3] = 0xFF
+					fb[p] = px[0]
+					fb[p+1] = px[1]
+					fb[p+2] = px[2]
+					fb[p+3] = px[3]
 				}
 			}
 		}
