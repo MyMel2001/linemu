@@ -36,7 +36,7 @@ func TestParseBootOrder(t *testing.T) {
 
 func TestSetupEFITables(t *testing.T) {
 	ram := mmu.NewRAM(16 * 1024 * 1024)
-	if err := SetupEFITables(ram, DefaultPayloadBase); err != nil {
+	if err := SetupEFITables(ram, DefaultPayloadBase, 0xE0000000, 1920, 1080); err != nil {
 		t.Fatalf("SetupEFITables: %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestFindEFIBootPayloadRawAndGPT(t *testing.T) {
 	// Test full UEFI boot execution
 	ram := mmu.NewRAM(32 * 1024 * 1024)
 	c := cpu.NewCPUState()
-	entry, err := BootUEFI(ram, c, dev)
+	entry, err := BootUEFI(ram, c, dev, 0xE0000000, 1920, 1080)
 	if err != nil {
 		t.Fatalf("BootUEFI: %v", err)
 	}

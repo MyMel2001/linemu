@@ -123,6 +123,12 @@ func NewVM(ramBytes uint64, numCores int) *VM {
 
 	vm.DRM.AttachInput(vm.PS2)
 
+	// Map guest framebuffer at FBAddress so guest pixel writes hit the displayed buffer
+	vm.MMU.MapMMIO(vm.DRM.FBAddress, vm.DRM.Framebuffer)
+	vm.DRM.OnFramebufferChange = func(fb []byte) {
+		vm.MMU.MapMMIO(vm.DRM.FBAddress, fb)
+	}
+
 	vm.PCI.AttachDevice(0, 1, 0, vm.Storage)
 	vm.PCI.AttachDevice(0, 2, 0, vm.NIC)
 	vm.PCI.AttachDevice(0, 3, 0, vm.HDA)
@@ -183,7 +189,7 @@ func (v *VM) BootUEFI(driveID int) error {
 	if !ok {
 		return fmt.Errorf("drive %d not attached", driveID)
 	}
-	_, err := uefi.BootUEFI(v.MMU, v.CPUs[0], info.Storage)
+	_, err := uefi.BootUEFI(v.MMU, v.CPUs[0], info.Storage, v.DRM.FBAddress, v.DRM.Width, v.DRM.Height)
 	return err
 }
 
@@ -239,6 +245,9 @@ func (v *VM) stepCPU(c *cpu.CPUState) error {
 		if err == nil && len(block.Ops) > 0 {
 			errExec := block.Execute(c, v.MMU, v.IO)
 			if errExec == cpu.ErrSyscallTrapped {
+				if uefi.IsHypercall(c.Regs[cpu.RAX]) {
+					return uefi.HandleService(c, v.MMU)
+				}
 				if errSys := v.Syscalls.Handle(c, v.MMU); errSys != nil {
 					return errSys
 				}
@@ -250,6 +259,9 @@ func (v *VM) stepCPU(c *cpu.CPUState) error {
 
 	err := c.Step(v.MMU, v.IO)
 	if err == cpu.ErrSyscallTrapped {
+		if uefi.IsHypercall(c.Regs[cpu.RAX]) {
+			return uefi.HandleService(c, v.MMU)
+		}
 		return v.Syscalls.Handle(c, v.MMU)
 	}
 	return err

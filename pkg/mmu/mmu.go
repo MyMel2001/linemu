@@ -30,9 +30,16 @@ func NewRAM(size uint64) *RAM {
 
 // MapMMIO registers a memory-mapped I/O region backed by an external byte slice.
 // Reads/writes to [base, base+len(data)) go to data instead of guest RAM.
+// Re-mapping the same base replaces the region (device framebuffer resize).
 func (r *RAM) MapMMIO(base uint64, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for i := range r.mmio {
+		if r.mmio[i].Base == base {
+			r.mmio[i] = MMIORegion{Base: base, Size: uint64(len(data)), Data: data}
+			return
+		}
+	}
 	r.mmio = append(r.mmio, MMIORegion{Base: base, Size: uint64(len(data)), Data: data})
 }
 

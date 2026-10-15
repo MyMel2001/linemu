@@ -73,7 +73,7 @@ func ParseBootOrder(spec string) []BootDeviceType {
 }
 
 // SetupEFITables initializes minimal UEFI Specification tables in guest RAM
-func SetupEFITables(ram *mmu.RAM, payloadBase uint64) error {
+func SetupEFITables(ram *mmu.RAM, payloadBase uint64, fbBase uint64, fbWidth, fbHeight uint32) error {
 	// 1. EFI_SYSTEM_TABLE at SystemTableBaseAddr
 	// Signature (8 bytes): "IBI SYST"
 	_ = ram.Write64(SystemTableBaseAddr, EFISystemTableSignature)
@@ -93,6 +93,9 @@ func SetupEFITables(ram *mmu.RAM, payloadBase uint64) error {
 
 	_ = ram.Write64(SystemTableBaseAddr+24, vendorAddr)              // FirmwareVendor
 	_ = ram.Write32(SystemTableBaseAddr+32, 0x00010000)              // FirmwareRevision
+	_ = ram.Write64(SystemTableBaseAddr+40, ConInAddr)               // ConsoleInHandle
+	_ = ram.Write64(SystemTableBaseAddr+48, ConInAddr)               // ConIn
+	_ = ram.Write64(SystemTableBaseAddr+56, ConOutBaseAddr)          // ConsoleOutHandle
 	_ = ram.Write64(SystemTableBaseAddr+64, ConOutBaseAddr)          // ConOut
 	_ = ram.Write64(SystemTableBaseAddr+72, ConOutBaseAddr)          // StdErr
 	_ = ram.Write64(SystemTableBaseAddr+88, RuntimeServicesBaseAddr) // RuntimeServices
@@ -101,7 +104,7 @@ func SetupEFITables(ram *mmu.RAM, payloadBase uint64) error {
 	// 2. Simple RET stub at 0x100080 for functions returning EFI_SUCCESS (0)
 	// XOR EAX, EAX (31 C0); RET (C3)
 	stubCode := []byte{0x31, 0xC0, 0xC3}
-	stubAddr := SystemTableBaseAddr + 0x80
+	stubAddr := SuccessStubAddr
 	if err := ram.LoadBytes(stubAddr, stubCode); err != nil {
 		return err
 	}
@@ -123,13 +126,18 @@ func SetupEFITables(ram *mmu.RAM, payloadBase uint64) error {
 		_ = ram.Write64(RuntimeServicesBaseAddr+offset, stubAddr)
 	}
 
-	// 5. EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL at ConOutBaseAddr
-	_ = ram.Write64(ConOutBaseAddr+8, stubAddr) // OutputString pointer
+	// 5. EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL, ConIn, GOP + hypercall stubs
+	if err := SetupGOP(ram, fbBase, fbWidth, fbHeight); err != nil {
+		return err
+	}
 
 	// 6. Loaded Image Protocol at LoadedImageBaseAddr
 	_ = ram.Write32(LoadedImageBaseAddr, 0x00010000)             // Revision
 	_ = ram.Write64(LoadedImageBaseAddr+32, payloadBase)         // ImageBase
 	_ = ram.Write64(LoadedImageBaseAddr+40, 1024*1024)          // ImageSize dummy
+
+	// 7. Point protocol-dispatch services and ConOut members at hypercall stubs
+	SetupProtocolOverrides(ram)
 
 	return nil
 }
@@ -376,7 +384,7 @@ func LoadEFIPayload(ram *mmu.RAM, state *cpu.CPUState, payload []byte) (uint64, 
 }
 
 // BootUEFI configures guest CPU and memory to boot the specified block device in 64-bit UEFI mode
-func BootUEFI(ram *mmu.RAM, c *cpu.CPUState, dev devices.BlockStorage) (uint64, error) {
+func BootUEFI(ram *mmu.RAM, c *cpu.CPUState, dev devices.BlockStorage, fbBase uint64, fbWidth, fbHeight uint32) (uint64, error) {
 	payload, err := FindEFIBootPayload(dev)
 	if err != nil {
 		return 0, err
@@ -387,7 +395,7 @@ func BootUEFI(ram *mmu.RAM, c *cpu.CPUState, dev devices.BlockStorage) (uint64, 
 		return 0, fmt.Errorf("failed loading EFI payload: %w", err)
 	}
 
-	if err := SetupEFITables(ram, DefaultPayloadBase); err != nil {
+	if err := SetupEFITables(ram, DefaultPayloadBase, fbBase, fbWidth, fbHeight); err != nil {
 		return 0, fmt.Errorf("failed configuring EFI tables: %w", err)
 	}
 

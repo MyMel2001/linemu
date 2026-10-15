@@ -875,3 +875,211 @@ func TestBTBTS(t *testing.T) {
 		t.Errorf("DL = %d, want 1 (CF set after bts)", c.Regs[cpu.RDX]&0xFF)
 	}
 }
+
+// Guest MMIO write to FBAddress reaches the displayed framebuffer.
+func TestFramebufferMMIOWrite(t *testing.T) {
+	// mov eax, 0x44332211; movabs rbx, 0xE0000000; mov [rbx], eax; hlt
+	code := []byte{
+		0xB8, 0x11, 0x22, 0x33, 0x44,
+		0x48, 0xBB, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00, 0x00,
+		0x89, 0x03,
+		0xF4,
+	}
+	vm := runSnippet(t, code, nil)
+	fb := vm.DRM.Framebuffer
+	if fb[0] != 0x11 || fb[1] != 0x22 || fb[2] != 0x33 || fb[3] != 0x44 {
+		t.Fatalf("framebuffer bytes = %02x %02x %02x %02x, want 11 22 33 44",
+			fb[0], fb[1], fb[2], fb[3])
+	}
+}
+
+// GOP tables: protocol points at Mode, Mode advertises FrameBufferBase/pitch.
+func TestGOPTables(t *testing.T) {
+	vm := NewVM(64*1024*1024, 1)
+	if err := uefi.SetupEFITables(vm.MMU, uefi.DefaultPayloadBase, 0xE0000000, 1920, 1080); err != nil {
+		t.Fatalf("SetupEFITables: %v", err)
+	}
+	v, err := vm.MMU.Read64(uefi.GOPProtocolAddr + 24)
+	if err != nil || v != uefi.GOPModeAddr {
+		t.Fatalf("GOP.Mode = 0x%x (err=%v), want 0x%x", v, err, uefi.GOPModeAddr)
+	}
+	if v, _ := vm.MMU.Read64(uefi.GOPModeAddr + 24); v != 0xE0000000 {
+		t.Fatalf("FrameBufferBase = 0x%x, want 0xE0000000", v)
+	}
+	if v, _ := vm.MMU.Read64(uefi.GOPModeAddr + 32); v != 1920*1080*4 {
+		t.Fatalf("FrameBufferSize = %d", v)
+	}
+	if v, _ := vm.MMU.Read32(uefi.GOPInfoAddr + 4); v != 1920 {
+		t.Fatalf("HRes = %d", v)
+	}
+	if v, _ := vm.MMU.Read32(uefi.GOPInfoAddr + 12); v != 1 {
+		t.Fatalf("PixelFormat = %d, want 1 (BGRX)", v)
+	}
+	// BootServices HandleProtocol slot points at hypercall stub, not success stub
+	if v, _ := vm.MMU.Read64(uefi.BootServicesBaseAddr + 152); v < uefi.StubBase {
+		t.Fatalf("HandleProtocol = 0x%x, want hypercall stub >= 0x%x", v, uefi.StubBase)
+	}
+}
+
+// LocateProtocol hypercall returns GOP address for the GOP GUID.
+func TestGOPLocateProtocol(t *testing.T) {
+	vm := NewVM(64*1024*1024, 1)
+	if err := uefi.SetupEFITables(vm.MMU, uefi.DefaultPayloadBase, 0xE0000000, 1920, 1080); err != nil {
+		t.Fatalf("SetupEFITables: %v", err)
+	}
+	c := vm.CPU()
+	c.Regs[cpu.RAX] = 0xE0000000 + 3 // svcLocateProtocol
+	c.Regs[cpu.RCX] = uefi.GOPGUIDAddr
+	out := uint64(0x20000)
+	c.Regs[cpu.R8] = out
+	if err := uefi.HandleService(c, vm.MMU); err != nil {
+		t.Fatalf("HandleService: %v", err)
+	}
+	if got := c.Regs[cpu.RAX]; got != 0 {
+		t.Fatalf("status = 0x%x, want EFI_SUCCESS", got)
+	}
+	if v, _ := vm.MMU.Read64(out); v != uefi.GOPProtocolAddr {
+		t.Fatalf("interface = 0x%x, want 0x%x", v, uefi.GOPProtocolAddr)
+	}
+}
+
+// Unknown GUID yields EFI_NOT_FOUND.
+func TestGOPUnknownGUID(t *testing.T) {
+	vm := NewVM(64*1024*1024, 1)
+	zero := make([]byte, 16)
+	if err := vm.MMU.LoadBytes(0x30000, zero); err != nil {
+		t.Fatal(err)
+	}
+	c := vm.CPU()
+	c.Regs[cpu.RAX] = 0xE0000000 + 3
+	c.Regs[cpu.RCX] = 0x30000
+	c.Regs[cpu.R8] = 0x30010
+	if err := uefi.HandleService(c, vm.MMU); err != nil {
+		t.Fatalf("HandleService: %v", err)
+	}
+	if got := c.Regs[cpu.RAX]; got != 0x800000000000000E {
+		t.Fatalf("status = 0x%x, want EFI_NOT_FOUND", got)
+	}
+}
+
+// Blt BufferToVideo paints a guest buffer into the framebuffer.
+func TestGOPBltBufferToVideo(t *testing.T) {
+	vm := NewVM(64*1024*1024, 1)
+	if err := uefi.SetupEFITables(vm.MMU, uefi.DefaultPayloadBase, 0xE0000000, 1920, 1080); err != nil {
+		t.Fatalf("SetupEFITables: %v", err)
+	}
+	// 2x1 pixel buffer: blue then green (BGRA)
+	buf := []byte{0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF}
+	if err := vm.MMU.LoadBytes(0x40000, buf); err != nil {
+		t.Fatal(err)
+	}
+	c := vm.CPU()
+	c.Regs[cpu.RAX] = 0xE0000000 + 12 // svcGopBlt
+	c.Regs[cpu.RDX] = 0x40000         // BltBuffer
+	c.Regs[cpu.R8] = 1                // BufferToVideo
+	c.Regs[cpu.R9] = 0                // SourceX
+	c.Regs[cpu.RSP] = 0x7FFFF0
+	stack := []struct {
+		off uint64
+		val uint64
+	}{
+		{0x28, 0},    // SourceY
+		{0x30, 10},   // DestX
+		{0x38, 20},   // DestY
+		{0x40, 2},    // Width
+		{0x48, 1},    // Height
+		{0x50, 8},    // Delta
+	}
+	for _, s := range stack {
+		if err := vm.MMU.Write64(0x7FFFF0+s.off, s.val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := uefi.HandleService(c, vm.MMU); err != nil {
+		t.Fatalf("HandleService: %v", err)
+	}
+	if got := c.Regs[cpu.RAX]; got != 0 {
+		t.Fatalf("status = 0x%x", got)
+	}
+	off := (20*1920 + 10) * 4
+	fb := vm.DRM.Framebuffer
+	if fb[off] != 0xFF || fb[off+1] != 0x00 || fb[off+2] != 0x00 {
+		t.Fatalf("pixel0 = %02x %02x %02x, want ff 00 00", fb[off], fb[off+1], fb[off+2])
+	}
+	if fb[off+4] != 0x00 || fb[off+5] != 0xFF || fb[off+6] != 0x00 {
+		t.Fatalf("pixel1 = %02x %02x %02x, want 00 ff 00", fb[off+4], fb[off+5], fb[off+6])
+	}
+}
+
+// ConOut OutputString renders guest text into the framebuffer.
+func TestConOutOutputString(t *testing.T) {
+	vm := NewVM(64*1024*1024, 1)
+	if err := uefi.SetupEFITables(vm.MMU, uefi.DefaultPayloadBase, 0xE0000000, 1920, 1080); err != nil {
+		t.Fatalf("SetupEFITables: %v", err)
+	}
+	str := []byte{'H', 0, 'i', 0, 0, 0}
+	if err := vm.MMU.LoadBytes(0x50000, str); err != nil {
+		t.Fatal(err)
+	}
+	c := vm.CPU()
+	c.Regs[cpu.RAX] = 0xE0000000 + 20 // svcOutputString
+	c.Regs[cpu.RDX] = 0x50000
+	if err := uefi.HandleService(c, vm.MMU); err != nil {
+		t.Fatalf("HandleService: %v", err)
+	}
+	if got := c.Regs[cpu.RAX]; got != 0 {
+		t.Fatalf("status = 0x%x", got)
+	}
+	lit := 0
+	for i := range vm.DRM.Framebuffer {
+		if vm.DRM.Framebuffer[i] != 0 {
+			lit++
+		}
+	}
+	if lit == 0 {
+		t.Fatal("framebuffer unchanged after OutputString")
+	}
+	if v, _ := vm.MMU.Read32(uefi.ConOutModeAddr + 12); v != 2 {
+		t.Fatalf("cursor col = %d, want 2", v)
+	}
+}
+
+// Full guest path: call stub with mov rax,svc; syscall; ret through the CPU.
+func TestGOPQueryModeGuestStub(t *testing.T) {
+	vm := NewVM(64*1024*1024, 1)
+	if err := uefi.SetupEFITables(vm.MMU, uefi.DefaultPayloadBase, 0xE0000000, 1920, 1080); err != nil {
+		t.Fatalf("SetupEFITables: %v", err)
+	}
+	sizeOut := uint64(0x60000)
+	infoOut := uint64(0x60008)
+	// mov rdx,0; mov r8,sizeOut; mov r9,infoOut; mov rax,svcQM; syscall; hlt
+	code := []byte{
+		0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00,
+		0x49, 0xB8, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x49, 0xB9, 0x08, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x48, 0xB8, 0x0A, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00, 0x00,
+		0x0F, 0x05,
+		0xF4,
+	}
+	if err := vm.MMU.LoadBytes(0x1000, code); err != nil {
+		t.Fatal(err)
+	}
+	c := vm.CPU()
+	c.RIP = 0x1000
+	c.Regs[cpu.RSP] = 0x7FFFF0
+	if err := vm.Run(10000); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !c.Halted {
+		t.Fatal("expected HLT")
+	}
+	if c.Regs[cpu.RAX] != 0 {
+		t.Fatalf("QueryMode status = 0x%x", c.Regs[cpu.RAX])
+	}
+	if v, _ := vm.MMU.Read64(sizeOut); v != 36 {
+		t.Fatalf("SizeOfInfo = %d, want 36", v)
+	}
+	if v, _ := vm.MMU.Read64(infoOut); v != uefi.GOPInfoAddr {
+		t.Fatalf("Info = 0x%x, want 0x%x", v, uefi.GOPInfoAddr)
+	}
+}

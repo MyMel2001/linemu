@@ -40,6 +40,9 @@ type KernelDRMBridge struct {
 	Framebuffer  []byte
 	Renderer     *DisplayRenderer
 	Input        InputDevice
+	// OnFramebufferChange notifies the memory bus owner that Framebuffer was reallocated
+	// (mode switch), so stale MMIO mappings can be refreshed.
+	OnFramebufferChange func(fb []byte)
 }
 
 func NewKernelDRMBridge() *KernelDRMBridge {
@@ -82,6 +85,15 @@ func (k *KernelDRMBridge) AttachInput(input InputDevice) {
 	if k.Renderer != nil {
 		k.Renderer.AttachInput(input)
 	}
+}
+
+// Font8x8Glyph returns the 8-byte bitmap glyph for ASCII ch, or nil if out of range.
+func Font8x8Glyph(ch byte) []byte {
+	off := int(ch) * 8
+	if off+8 > len(font8x8Data) {
+		return nil
+	}
+	return font8x8Data[off : off+8]
 }
 
 // WritePixel updates a pixel at (x, y) with color in BGRA format
@@ -235,6 +247,9 @@ func (k *KernelDRMBridge) DispatchCommand(cmd uint32, args []uint32) error {
 			if k.Renderer != nil {
 				k.Renderer.Width = k.Width
 				k.Renderer.Height = k.Height
+			}
+			if k.OnFramebufferChange != nil {
+				k.OnFramebufferChange(k.Framebuffer)
 			}
 		}
 	case 0x02: // Bind host hardware API (DirectX 12 / Vulkan / OpenGL)
