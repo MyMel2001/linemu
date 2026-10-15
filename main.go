@@ -13,9 +13,12 @@ import (
 	"linemu/pkg/pci"
 	"linemu/pkg/syscalls"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 type VM struct {
@@ -178,7 +181,7 @@ func (v *VM) Run(maxInstructions int) error {
 		wg.Add(1)
 		go func(c *cpu.CPUState) {
 			defer wg.Done()
-			for i := 0; i < maxInstructions && !c.Halted; i++ {
+			for i := 0; (maxInstructions <= 0 || i < maxInstructions) && !c.Halted; i++ {
 				if err := v.stepCPU(c); err != nil {
 					errs <- err
 					return
@@ -268,7 +271,48 @@ func main() {
 	} else {
 		fmt.Printf("Live graphics display active: mode=%s, resolution=%dx%d\n", *displayMode, vm.DRM.Width, vm.DRM.Height)
 		defer renderer.Stop()
+		vm.DRM.Flush()
 	}
 
 	fmt.Printf("LinEMU initialized successfully: %d MB RAM, %d vCPU core(s), PCI Host Bridge, JIT Ready.\n", ramBytes/(1024*1024), *cores)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
+	if graphics.DisplayMode(*displayMode) != graphics.DisplayHeadless {
+		refreshRate := 33 * time.Millisecond
+		if graphics.DisplayMode(*displayMode) == graphics.DisplayTerminal {
+			refreshRate = 100 * time.Millisecond
+		}
+		ticker := time.NewTicker(refreshRate)
+		defer ticker.Stop()
+		go func() {
+			for range ticker.C {
+				vm.DRM.Flush()
+			}
+		}()
+	}
+
+	vmDone := make(chan struct{})
+	go func() {
+		_ = vm.Run(0)
+		close(vmDone)
+	}()
+
+	if renderer.HasExternalViewer() {
+		waitCh := make(chan struct{})
+		go func() {
+			_ = renderer.Wait()
+			close(waitCh)
+		}()
+		select {
+		case <-sig:
+		case <-waitCh:
+		}
+	} else {
+		select {
+		case <-sig:
+		case <-vmDone:
+		}
+	}
 }

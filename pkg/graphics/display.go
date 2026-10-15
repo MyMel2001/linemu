@@ -268,7 +268,9 @@ func (d *DisplayRenderer) streamLoop() {
 		}
 
 		if cmdStdin != nil {
-			_, _ = cmdStdin.Write(frame)
+			if _, err := cmdStdin.Write(frame); err != nil {
+				break
+			}
 			continue
 		}
 
@@ -276,6 +278,22 @@ func (d *DisplayRenderer) streamLoop() {
 			d.renderTerminal(frame, w)
 		}
 	}
+}
+
+func (d *DisplayRenderer) HasExternalViewer() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.extCmd != nil
+}
+
+func (d *DisplayRenderer) Wait() error {
+	d.mu.Lock()
+	cmd := d.extCmd
+	d.mu.Unlock()
+	if cmd != nil {
+		return cmd.Wait()
+	}
+	return nil
 }
 
 // renderTerminal downscales framebuffer to ANSI 24-bit truecolor escape blocks
