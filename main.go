@@ -346,16 +346,26 @@ func main() {
 		slot++
 	}
 
+	bootStatus := "No bootable media specified (System Idle / Halted)"
 	if slot > 0 {
 		bootDrive, bootMethod, err := vm.Boot()
 		if err != nil {
+			bootStatus = fmt.Sprintf("Boot failed: %v", err)
 			fmt.Printf("Notice: boot sequence: %v\n", err)
 		} else {
 			info, _ := vm.Storage.GetDriveInfo(bootDrive)
+			bootStatus = fmt.Sprintf("Booted via %s from Drive %d (Unique ID: %s, RIP: 0x%X)",
+				bootMethod, bootDrive, info.UniqueID, vm.CPU().RIP)
 			fmt.Printf("Booted successfully via %s from Drive %d (Unique ID: %s, RIP: 0x%X)\n",
 				bootMethod, bootDrive, info.UniqueID, vm.CPU().RIP)
 		}
+	} else {
+		if vm.CPU() != nil {
+			vm.CPU().Halted = true
+		}
 	}
+
+	vm.DRM.RenderBootScreen(ramBytes/(1024*1024), *cores, *displayMode, bootStatus)
 
 	renderer := graphics.NewDisplayRenderer(graphics.DisplayMode(*displayMode), vm.DRM.Width, vm.DRM.Height)
 	renderer.AttachInput(vm.PS2)
@@ -396,6 +406,7 @@ func main() {
 		close(vmDone)
 	}()
 
+	// ponytail: viewer lifecycle; window stays open until user closes viewer or sends signal
 	if renderer.HasExternalViewer() {
 		waitCh := make(chan struct{})
 		go func() {
@@ -405,6 +416,10 @@ func main() {
 		select {
 		case <-sig:
 		case <-waitCh:
+		}
+	} else if graphics.DisplayMode(*displayMode) == graphics.DisplayTerminal {
+		select {
+		case <-sig:
 		}
 	} else {
 		select {

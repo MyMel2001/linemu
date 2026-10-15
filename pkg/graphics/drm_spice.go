@@ -1,10 +1,21 @@
 package graphics
 
 import (
+	"encoding/base64"
 	"fmt"
 	"linemu/pkg/pci"
 	"sync"
 )
+
+var font8x8Data []byte
+
+func init() {
+	var err error
+	font8x8Data, err = base64.StdEncoding.DecodeString("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGDw8GBgAGAA2NgAAAAAAADY2fzZ/NjYADD4DHjAfDAAAYzMYDGZjABw2HG47M24ABgYDAAAAAAAYDAYGBgwYAAYMGBgYDAYAAGY8/zxmAAAADAw/DAwAAAAAAAAADAwGAAAAPwAAAAAAAAAAAAwMAGAwGAwGAwEAPmNze29nPgAMDgwMDAw/AB4zMBwGMz8AHjMwHDAzHgA4PDYzfzB4AD8DHzAwMx4AHAYDHzMzHgA/MzAYDAwMAB4zMx4zMx4AHjMzPjAYDgAADAwAAAwMAAAMDAAADAwGGAwGAwYMGAAAAD8AAD8AAAYMGDAYDAYAHjMwGAwADAA+Y3t7ewMeAAweMzM/MzMAP2ZmPmZmPwA8ZgMDA2Y8AB82ZmZmNh8Af0YWHhZGfwB/RhYeFgYPADxmAwNzZnwAMzMzPzMzMwAeDAwMDAweAHgwMDAzMx4AZ2Y2HjZmZwAPBgYGRmZ/AGN3f39rY2MAY2dve3NjYwAcNmNjYzYcAD9mZj4GBg8AHjMzMzseOAA/ZmY+NmZnAB4zBw44Mx4APy0MDAwMHgAzMzMzMzM/ADMzMzMzHgwAY2Nja393YwBjYzYcHDZjADMzMx4MDB4Af2MxGExmfwAeBgYGBgYeAAMGDBgwYEAAHhgYGBgYHgAIHDZjAAAAAAAAAAAAAAD/DAwYAAAAAAAAAB4wPjNuAAcGBj5mZjsAAAAeMwMzHgA4MDA+MzNuAAAAHjM/Ax4AHDYGDwYGDwAAAG4zMz4wHwcGNm5mZmcADAAODAwMHgAwADAwMDMzHgcGZjYeNmcADgwMDAwMHgAAADN/f2tjAAAAHzMzMzMAAAAeMzMzHgAAADtmZj4GDwAAbjMzPjB4AAA7bmYGDwAAAD4DHjAfAAgMPgwMLBgAAAAzMzMzbgAAADMzMx4MAAAAY2t/fzYAAABjNhw2YwAAADMzMz4wHwAAPxkMJj8AOAwMBwwMOAAYGBgAGBgYAAcMDDgMDAcAbjsAAAAAAAAAAAAAAAAAAA==")
+	if err != nil {
+		panic(err)
+	}
+}
 
 type GraphicsAPI int
 
@@ -49,6 +60,7 @@ func NewKernelDRMBridge() *KernelDRMBridge {
 		Framebuffer:   make([]byte, fbSize),
 		Renderer:      NewDisplayRenderer(DisplayWindow, w, h),
 	}
+	k.RenderBootScreen(64, 1, "window", "LinEmu UEFI Initializing...")
 	k.BARSizes[0] = 0x4000000 // 64MB Framebuffer
 	k.BARSizes[1] = 0x2000000 // 32MB Command / Surface RAM
 	k.BARSizes[2] = 0x2000    // 8KB MMIO / I/O space
@@ -99,6 +111,108 @@ func (k *KernelDRMBridge) Flush() {
 	if renderer != nil {
 		renderer.PresentFrame(fb)
 	}
+}
+
+// FillRect fills rectangle in Framebuffer with BGRA color
+func (k *KernelDRMBridge) FillRect(rx, ry, rw, rh uint32, b, g, r uint8) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for y := ry; y < ry+rh && y < k.Height; y++ {
+		rowStart := y * k.Width * 4
+		for x := rx; x < rx+rw && x < k.Width; x++ {
+			offset := rowStart + x*4
+			k.Framebuffer[offset] = b
+			k.Framebuffer[offset+1] = g
+			k.Framebuffer[offset+2] = r
+			k.Framebuffer[offset+3] = 0xFF
+		}
+	}
+}
+
+// DrawText renders string text at (x, y) with scale and color (b, g, r)
+func (k *KernelDRMBridge) DrawText(startX, startY uint32, text string, b, g, r uint8, scale uint32) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	curX := startX
+	curY := startY
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if ch == '\n' {
+			curX = startX
+			curY += 10 * scale
+			continue
+		}
+		if int(ch)*8+8 <= len(font8x8Data) {
+			glyph := font8x8Data[int(ch)*8 : int(ch)*8+8]
+			for row := uint32(0); row < 8; row++ {
+				rowBits := glyph[row]
+				py := curY + row*scale
+				if py >= k.Height {
+					continue
+				}
+				for col := uint32(0); col < 8; col++ {
+					if (rowBits & (1 << col)) != 0 {
+						px := curX + col*scale
+						for sy := uint32(0); sy < scale && py+sy < k.Height; sy++ {
+							rowStart := (py + sy) * k.Width * 4
+							for sx := uint32(0); sx < scale && px+sx < k.Width; sx++ {
+								offset := rowStart + (px+sx)*4
+								k.Framebuffer[offset] = b
+								k.Framebuffer[offset+1] = g
+								k.Framebuffer[offset+2] = r
+								k.Framebuffer[offset+3] = 0xFF
+							}
+						}
+					}
+				}
+			}
+		}
+		curX += 8 * scale
+	}
+}
+
+// RenderBootScreen paints firmware boot screen onto Framebuffer
+func (k *KernelDRMBridge) RenderBootScreen(ramMB uint64, cores int, displayMode string, bootStatus string) {
+	// Deep navy background (0x22, 0x14, 0x0A)
+	k.FillRect(0, 0, k.Width, k.Height, 0x22, 0x14, 0x0A)
+
+	// Top banner bar (0x35, 0x22, 0x16)
+	k.FillRect(0, 0, k.Width, 90, 0x35, 0x22, 0x16)
+	k.FillRect(0, 90, k.Width, 4, 0x88, 0x55, 0x22)
+
+	// Title
+	k.DrawText(60, 25, "LinEmu UEFI Firmware v2.10", 0xFF, 0xFF, 0xFF, 4)
+
+	// Box in center
+	boxX := uint32(60)
+	boxY := uint32(140)
+	boxW := k.Width - 120
+	boxH := k.Height - 240
+	k.FillRect(boxX, boxY, boxW, boxH, 0x2C, 0x1A, 0x10)
+	k.FillRect(boxX, boxY, boxW, 2, 0x55, 0x33, 0x20)
+	k.FillRect(boxX, boxY+boxH-2, boxW, 2, 0x55, 0x33, 0x20)
+
+	// Information lines
+	textX := boxX + 40
+	textY := boxY + 40
+	spacing := uint32(40)
+
+	k.DrawText(textX, textY, "System Architecture : x86_64", 0xEE, 0xCC, 0xAA, 3)
+	textY += spacing
+	k.DrawText(textX, textY, fmt.Sprintf("Processor Cores     : %d vCPU core(s)", cores), 0xEE, 0xCC, 0xAA, 3)
+	textY += spacing
+	k.DrawText(textX, textY, fmt.Sprintf("System Memory (RAM) : %d MB", ramMB), 0xEE, 0xCC, 0xAA, 3)
+	textY += spacing
+	k.DrawText(textX, textY, fmt.Sprintf("Graphics Display    : %dx%d 32bpp (%s)", k.Width, k.Height, displayMode), 0xEE, 0xCC, 0xAA, 3)
+	textY += spacing
+	k.DrawText(textX, textY, "PCI Subsystem       : Initialized (Host Bridge 0xCF8/0xCFC)", 0xEE, 0xCC, 0xAA, 3)
+	textY += spacing + 20
+
+	k.DrawText(textX, textY, fmt.Sprintf("Boot Status         : %s", bootStatus), 0x80, 0xFF, 0x80, 3)
+
+	// Footer bar
+	k.FillRect(0, k.Height-60, k.Width, 60, 0x1A, 0x0F, 0x08)
+	k.DrawText(60, k.Height-42, "LinEmu x86_64 Hardware Translation Emulator - Press 'q' or close window to exit", 0xAA, 0xAA, 0xAA, 2)
 }
 
 type SPICEProtocolMessage struct {
