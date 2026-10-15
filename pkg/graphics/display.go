@@ -118,12 +118,13 @@ func (d *DisplayRenderer) Start() error {
 	// Check if external window viewer pipe (ffplay/mpv/custom) is feasible
 	if d.Mode == DisplayWindow {
 		// Spawn real-time raw frame player if available; fallback to terminal truecolor
+		// ponytail: bgr0 assumes standard 32bpp BGRX framebuffer; upgrade path: guest FOURCC DRM format negotiation.
 		var cmd *exec.Cmd
 		if _, err := exec.LookPath("ffplay"); err == nil {
 			cmd = exec.Command("ffplay",
 				"-loglevel", "quiet",
 				"-f", "rawvideo",
-				"-pixel_format", "bgra",
+				"-pixel_format", "bgr0",
 				"-video_size", fmt.Sprintf("%dx%d", d.Width, d.Height),
 				"-framerate", "30",
 				"-window_title", "LinEMU Display",
@@ -134,7 +135,7 @@ func (d *DisplayRenderer) Start() error {
 				"--demuxer=rawvideo",
 				fmt.Sprintf("--demuxer-rawvideo-w=%d", d.Width),
 				fmt.Sprintf("--demuxer-rawvideo-h=%d", d.Height),
-				"--demuxer-rawvideo-format=bgra",
+				"--demuxer-rawvideo-format=bgr0",
 				"--demuxer-rawvideo-fps=30",
 				"--title=LinEMU Display",
 				"-",

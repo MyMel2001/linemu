@@ -390,6 +390,30 @@ func (c *CPUState) Step(mem Memory, io IOBus) error {
 		}
 		return nil
 
+	case 0xC3: // RET
+		c.RIP++
+		addr, err := mem.Read64(c.Regs[RSP])
+		if err != nil {
+			return err
+		}
+		c.Regs[RSP] += 8
+		c.RIP = addr
+		return nil
+
+	case 0xE8: // CALL rel32
+		c.RIP++
+		rel, err := mem.Read32(c.RIP)
+		if err != nil {
+			return err
+		}
+		c.RIP += 4
+		c.Regs[RSP] -= 8
+		if err := mem.Write64(c.Regs[RSP], c.RIP); err != nil {
+			return err
+		}
+		c.RIP = uint64(int64(c.RIP) + int64(int32(rel)))
+		return nil
+
 	case 0xE4, 0xE5: // IN AL/eAX, imm8
 		c.RIP++
 		port, err := mem.Read8(c.RIP)

@@ -182,6 +182,16 @@ func (s *StorageController) GetDriveInfo(driveID int) (*DriveInfo, bool) {
 	return info, ok
 }
 
+func (s *StorageController) GetAllDrives() map[int]*DriveInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res := make(map[int]*DriveInfo, len(s.drives))
+	for k, v := range s.drives {
+		res[k] = v
+	}
+	return res
+}
+
 func (s *StorageController) Read(port uint16, size int) (uint32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

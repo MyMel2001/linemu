@@ -6,6 +6,7 @@ import (
 	"linemu/pkg/devices"
 	"linemu/pkg/graphics"
 	"linemu/pkg/syscalls"
+	"linemu/pkg/uefi"
 	"os"
 	"path/filepath"
 	"testing"
@@ -405,5 +406,103 @@ func TestDisplayInputInheritance(t *testing.T) {
 	mb0, _ := vm.IO.In(0x60, 1)
 	if (mb0 & 0x08) != 0x08 {
 		t.Errorf("expected mouse packet header 0x08, got 0x%02x", mb0)
+	}
+}
+
+func TestUEFIBootSequenceAndOrder(t *testing.T) {
+	vm := NewVM(32*1024*1024, 1)
+
+	// Drive 0: HDD with legacy MBR boot code (MOV EAX, 0x1111; HLT)
+	hdd := devices.NewMemoryBlockDevice(10)
+	var mbr [512]byte
+	mbrCode := []byte{0xB8, 0x11, 0x11, 0x00, 0x00, 0xF4}
+	copy(mbr[:], mbrCode)
+	_ = hdd.WriteSector(0, mbr[:])
+	vm.Storage.Attach(0, "HDD_DISK_0", devices.DriveHDD, hdd)
+
+	// Drive 1: CDROM with raw UEFI payload (MOV EAX, 0x2222; HLT)
+	cdrom := devices.NewMemoryBlockDevice(10)
+	var efiSec [512]byte
+	efiCode := []byte{0xB8, 0x22, 0x22, 0x00, 0x00, 0xF4}
+	copy(efiSec[:], efiCode)
+	// Write FAT BPB and directory entry pointing to cluster 2
+	var bpb [512]byte
+	bpb[11] = 0x00
+	bpb[12] = 0x02 // 512 bytes/sec
+	bpb[13] = 1    // 1 sec/cluster
+	bpb[14] = 1    // 1 reserved sec
+	bpb[16] = 1    // 1 FAT
+	bpb[17] = 16   // 16 root entries
+	bpb[22] = 1    // 1 sec/FAT
+	_ = cdrom.WriteSector(0, bpb[:])
+	var dir [512]byte
+	copy(dir[0:11], []byte("BOOTX64 EFI"))
+	dir[26] = 2 // cluster 2
+	dir[28] = 6 // file size 6 bytes
+	_ = cdrom.WriteSector(2, dir[:])
+	_ = cdrom.WriteSector(3, efiSec[:])
+	vm.Storage.Attach(1, "CDROM_DISC_1", devices.DriveCDDVD, cdrom)
+
+	// Test 1: Boot order CDROM first ("cdrom,hdd") -> Boots UEFI from Drive 1
+	vm.BootOrder = []uefi.BootDeviceType{uefi.BootTypeCDROM, uefi.BootTypeHDD}
+	bootID, method, err := vm.Boot()
+	if err != nil {
+		t.Fatalf("vm.Boot cdrom,hdd: %v", err)
+	}
+	if bootID != 1 || method != "UEFI" {
+		t.Errorf("expected Drive 1 via UEFI, got Drive %d via %s", bootID, method)
+	}
+	if vm.CPU().RIP != uefi.DefaultPayloadBase {
+		t.Errorf("expected RIP=0x%X, got 0x%X", uefi.DefaultPayloadBase, vm.CPU().RIP)
+	}
+	if err := vm.Run(10); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if vm.CPU().Regs[cpu.RAX] != 0x2222 {
+		t.Errorf("expected RAX=0x2222, got 0x%X", vm.CPU().Regs[cpu.RAX])
+	}
+
+	// Test 2: Boot order HDD first ("hdd,cdrom") with BootLegacyOnly -> Boots Legacy MBR from Drive 0
+	vm.BootOrder = []uefi.BootDeviceType{uefi.BootTypeHDD, uefi.BootTypeCDROM}
+	vm.BootMode = BootLegacyOnly
+	bootID, method, err = vm.Boot()
+	if err != nil {
+		t.Fatalf("vm.Boot hdd,cdrom legacy: %v", err)
+	}
+	if bootID != 0 || method != "Legacy MBR" {
+		t.Errorf("expected Drive 0 via Legacy MBR, got Drive %d via %s", bootID, method)
+	}
+	if vm.CPU().RIP != 0x7C00 {
+		t.Errorf("expected RIP=0x7C00, got 0x%X", vm.CPU().RIP)
+	}
+	vm.CPU().Halted = false
+	if err := vm.Run(10); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if vm.CPU().Regs[cpu.RAX] != 0x1111 {
+		t.Errorf("expected RAX=0x1111, got 0x%X", vm.CPU().Regs[cpu.RAX])
+	}
+
+	// Test 3: Specific Drive ID boot order ("1,0")
+	vm.BootOrder = []uefi.BootDeviceType{"1", "0"}
+	vm.BootMode = BootAuto
+	bootID, method, err = vm.Boot()
+	if err != nil {
+		t.Fatalf("vm.Boot 1,0: %v", err)
+	}
+	if bootID != 1 {
+		t.Errorf("expected Drive 1, got Drive %d (method=%s)", bootID, method)
+	}
+
+	// Test 4: Boot fallback when first device is unbootable
+	emptyDev := devices.NewMemoryBlockDevice(10)
+	vm.Storage.Attach(2, "EMPTY_DRIVE_2", devices.DriveFloppy, emptyDev)
+	vm.BootOrder = []uefi.BootDeviceType{uefi.BootTypeFloppy, uefi.BootTypeHDD}
+	bootID, method, err = vm.Boot()
+	if err != nil {
+		t.Fatalf("vm.Boot fallback: %v", err)
+	}
+	if bootID != 0 {
+		t.Errorf("expected fallback to Drive 0, got Drive %d (method=%s)", bootID, method)
 	}
 }

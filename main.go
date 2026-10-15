@@ -12,6 +12,7 @@ import (
 	"linemu/pkg/mmu"
 	"linemu/pkg/pci"
 	"linemu/pkg/syscalls"
+	"linemu/pkg/uefi"
 	"os"
 	"os/signal"
 	"strconv"
@@ -19,6 +20,14 @@ import (
 	"sync"
 	"syscall"
 	"time"
+)
+
+type BootMode int
+
+const (
+	BootAuto BootMode = iota
+	BootUEFIOnly
+	BootLegacyOnly
 )
 
 type VM struct {
@@ -35,6 +44,8 @@ type VM struct {
 	Syscalls   *syscalls.SyscallHandler
 	UseJIT     bool
 	NumCores   int
+	BootOrder  []uefi.BootDeviceType
+	BootMode   BootMode
 }
 
 // CPU returns the primary bootstrap CPU (vCPU 0)
@@ -102,6 +113,8 @@ func NewVM(ramBytes uint64, numCores int) *VM {
 		Syscalls:   syscalls.NewSyscallHandler(),
 		UseJIT:     true,
 		NumCores:   numCores,
+		BootOrder:  []uefi.BootDeviceType{uefi.BootTypeCDROM, uefi.BootTypeHDD, uefi.BootTypeUSB},
+		BootMode:   BootAuto,
 	}
 
 	vm.DRM.AttachInput(vm.PS2)
@@ -144,11 +157,76 @@ func (v *VM) BootFromSector(driveID int) error {
 	if err := info.Storage.ReadSector(0, bootSector[:]); err != nil {
 		return fmt.Errorf("failed to read boot sector: %w", err)
 	}
+	allZero := true
+	for _, b := range bootSector {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return fmt.Errorf("drive %d boot sector is empty", driveID)
+	}
 	if err := v.MMU.LoadBytes(0x7C00, bootSector[:]); err != nil {
 		return err
 	}
 	v.CPUs[0].RIP = 0x7C00
 	return nil
+}
+
+func (v *VM) BootUEFI(driveID int) error {
+	info, ok := v.Storage.GetDriveInfo(driveID)
+	if !ok {
+		return fmt.Errorf("drive %d not attached", driveID)
+	}
+	_, err := uefi.BootUEFI(v.MMU, v.CPUs[0], info.Storage)
+	return err
+}
+
+func (v *VM) Boot() (int, string, error) {
+	drives := v.Storage.GetAllDrives()
+	if len(drives) == 0 {
+		return -1, "", fmt.Errorf("no storage drives attached")
+	}
+
+	for _, target := range v.BootOrder {
+		for id, info := range drives {
+			match := false
+			if strconv.Itoa(id) == string(target) {
+				match = true
+			} else {
+				switch target {
+				case uefi.BootTypeCDROM:
+					match = (info.Type == devices.DriveCDDVD)
+				case uefi.BootTypeHDD:
+					match = (info.Type == devices.DriveHDD)
+				case uefi.BootTypeFloppy:
+					match = (info.Type == devices.DriveFloppy)
+				case uefi.BootTypeUSB:
+					match = (info.Type == devices.DriveUSB)
+				}
+			}
+			if !match {
+				continue
+			}
+
+			// Try UEFI first
+			if v.BootMode != BootLegacyOnly {
+				if err := v.BootUEFI(id); err == nil {
+					return id, "UEFI", nil
+				}
+			}
+
+			// Fallback: Legacy MBR
+			if v.BootMode != BootUEFIOnly {
+				if err := v.BootFromSector(id); err == nil {
+					return id, "Legacy MBR", nil
+				}
+			}
+		}
+	}
+
+	return -1, "", fmt.Errorf("no bootable media found in boot order: %v", v.BootOrder)
 }
 
 func (v *VM) stepCPU(c *cpu.CPUState) error {
@@ -208,6 +286,8 @@ func main() {
 	displayMode := flag.String("display", "window", "Graphics display mode: 'window' (real onscreen window), 'terminal' (ANSI 24-bit color), 'none' (headless)")
 	ramStr := flag.String("m", "64M", "Custom guest RAM size (e.g. 512M, 2G, 4GB)")
 	cores := flag.Int("smp", 1, "Number of vCPU cores")
+	bootOrderStr := flag.String("boot", "cdrom,hdd", "Boot device order (e.g. 'cd,hdd', 'iso,img', 'd,c', 'hdd,cd')")
+	uefiStr := flag.String("uefi", "auto", "UEFI boot mode: 'auto' (UEFI with Legacy fallback), 'true'/'on' (UEFI only), 'false'/'legacy' (Legacy MBR only)")
 	flag.Parse()
 
 	ramBytes, err := parseRAMSize(*ramStr)
@@ -234,6 +314,16 @@ func main() {
 	}
 
 	vm := NewVM(ramBytes, *cores)
+	vm.BootOrder = uefi.ParseBootOrder(*bootOrderStr)
+
+	switch strings.ToLower(strings.TrimSpace(*uefiStr)) {
+	case "true", "on", "1", "uefi":
+		vm.BootMode = BootUEFIOnly
+	case "false", "off", "0", "legacy", "mbr":
+		vm.BootMode = BootLegacyOnly
+	default:
+		vm.BootMode = BootAuto
+	}
 
 	slot := 0
 	if *imgPath != "" {
@@ -253,10 +343,17 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("Attached ISO image [%s] with Unique ID: %s (Drive %d)\n", *isoPath, uid, slot)
-		if err := vm.BootFromSector(slot); err != nil {
-			fmt.Printf("Notice: could not read MBR from ISO (%v)\n", err)
+		slot++
+	}
+
+	if slot > 0 {
+		bootDrive, bootMethod, err := vm.Boot()
+		if err != nil {
+			fmt.Printf("Notice: boot sequence: %v\n", err)
 		} else {
-			fmt.Printf("Loaded boot sector from ISO drive %d (Unique ID: %s) to 0x7C00\n", slot, uid)
+			info, _ := vm.Storage.GetDriveInfo(bootDrive)
+			fmt.Printf("Booted successfully via %s from Drive %d (Unique ID: %s, RIP: 0x%X)\n",
+				bootMethod, bootDrive, info.UniqueID, vm.CPU().RIP)
 		}
 	}
 

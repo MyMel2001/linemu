@@ -6,6 +6,7 @@ x86_64 hardware translation emulator written in pure Go without external runtime
 - **JIT & Dynamic Retranslation**: Translates guest x86_64 instruction sequences into intermediate representations with an execution cache.
 - **Full PCI Subsystem**: Emulates PCI Host Bridge Configuration Space (ports `0xCF8` and `0xCFC`), automatic BAR allocation sizing, and multi-function device discovery.
 - **Virtual Disk Images & ISO Booting**: Supports direct booting from ISO and raw IMG disk images, with the ability to dynamically create new virtual HDD images without relying on user physical drives.
+- **UEFI Firmware & Boot Order**: Full 64-bit UEFI environment with EFI System Table, Boot Services, Runtime Services, GPT ESP, El Torito, and configurable boot priority order (`-boot`) with Legacy MBR fallback (`-uefi`).
 - **Unique Drive Identifiers**: All attached virtual drives and storage media are assigned cryptographic/hardware unique IDs on boot and reported via IDE/ATA `IDENTIFY DEVICE`.
 - **Intel e1000 Gigabit NIC**: Standard Intel 82540EM PCI network adapter with full EEPROM emulation and TX/RX descriptor ring processing for Windows 11 and Linux in-box drivers.
 - **Intel High Definition Audio (HDA)**: PCI audio controller supporting CORB/RIRB DMA buffers and integrated Realtek ALC888 codec verb responses.
@@ -51,6 +52,21 @@ go run main.go -img=my_disk.img -m=4G -smp=4
 
 # Allocate 512MB RAM with 2 vCPU cores
 go run main.go -iso=installer.iso -m=512M -smp=2
+```
+
+### 6. UEFI Booting and Boot Order Priority
+```sh
+# Boot UEFI by default (prioritizing CD/ISO over virtual HDD)
+go run main.go -iso=win11.iso -img=win11_hdd.img -boot=cd,hdd
+
+# Prioritize HDD over CD/ISO
+go run main.go -iso=win11.iso -img=win11_hdd.img -boot=hdd,cd
+
+# Enforce strict UEFI mode only (no Legacy fallback)
+go run main.go -img=win11_hdd.img -uefi=true
+
+# Enforce Legacy BIOS / MBR mode only
+go run main.go -img=my_disk.img -uefi=false
 ```
 
 ## Building and Testing
