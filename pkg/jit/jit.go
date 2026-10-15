@@ -1,7 +1,6 @@
 package jit
 
 import (
-	"fmt"
 	"linemu/pkg/bus"
 	"linemu/pkg/cpu"
 	"sync"
@@ -60,32 +59,19 @@ func (b *BasicBlock) Execute(c *cpu.CPUState, mem cpu.Memory, io bus.Device) err
 			c.Regs[op.DstReg] = c.Regs[op.SrcReg]
 
 		case OpAddReg:
-			res := c.Regs[op.DstReg] + c.Regs[op.SrcReg]
-			c.UpdateFlags(c.Regs[op.DstReg], c.Regs[op.SrcReg], res, false)
-			c.Regs[op.DstReg] = res
+			c.Regs[op.DstReg] = cpu.ALU(c, cpu.ALUAdd, c.Regs[op.DstReg], c.Regs[op.SrcReg], jitSize(op.Size))
 
 		case OpSubReg:
-			res := c.Regs[op.DstReg] - c.Regs[op.SrcReg]
-			c.UpdateFlags(c.Regs[op.DstReg], c.Regs[op.SrcReg], res, true)
-			c.Regs[op.DstReg] = res
+			c.Regs[op.DstReg] = cpu.ALU(c, cpu.ALUSub, c.Regs[op.DstReg], c.Regs[op.SrcReg], jitSize(op.Size))
 
 		case OpXorReg:
-			res := c.Regs[op.DstReg] ^ c.Regs[op.SrcReg]
-			c.Regs[op.DstReg] = res
-			c.SetZF(res == 0)
-			c.SetSF((res & 0x8000000000000000) != 0)
+			c.Regs[op.DstReg] = cpu.ALU(c, cpu.ALUXor, c.Regs[op.DstReg], c.Regs[op.SrcReg], jitSize(op.Size))
 
 		case OpAndReg:
-			res := c.Regs[op.DstReg] & c.Regs[op.SrcReg]
-			c.Regs[op.DstReg] = res
-			c.SetZF(res == 0)
-			c.SetSF((res & 0x8000000000000000) != 0)
+			c.Regs[op.DstReg] = cpu.ALU(c, cpu.ALUAnd, c.Regs[op.DstReg], c.Regs[op.SrcReg], jitSize(op.Size))
 
 		case OpOrReg:
-			res := c.Regs[op.DstReg] | c.Regs[op.SrcReg]
-			c.Regs[op.DstReg] = res
-			c.SetZF(res == 0)
-			c.SetSF((res & 0x8000000000000000) != 0)
+			c.Regs[op.DstReg] = cpu.ALU(c, cpu.ALUOr, c.Regs[op.DstReg], c.Regs[op.SrcReg], jitSize(op.Size))
 
 		case OpInPort:
 			val, err := io.Read(uint16(op.Imm), op.Size)
@@ -101,18 +87,18 @@ func (b *BasicBlock) Execute(c *cpu.CPUState, mem cpu.Memory, io bus.Device) err
 			}
 
 		case OpJmpRel:
-			c.RIP = uint64(int64(c.RIP) + int64(op.Imm))
+			c.RIP = uint64(int64(c.RIP+b.ByteLen) + int64(op.Imm))
 			return nil
 
 		case OpJzRel:
 			if c.GetZF() {
-				c.RIP = uint64(int64(c.RIP) + int64(op.Imm))
+				c.RIP = uint64(int64(c.RIP+b.ByteLen) + int64(op.Imm))
 				return nil
 			}
 
 		case OpJnzRel:
 			if !c.GetZF() {
-				c.RIP = uint64(int64(c.RIP) + int64(op.Imm))
+				c.RIP = uint64(int64(c.RIP+b.ByteLen) + int64(op.Imm))
 				return nil
 			}
 
@@ -186,6 +172,7 @@ func (t *Translator) Compile(pc uint64, mem cpu.Memory) (*BasicBlock, error) {
 	terminated := false
 
 	for !terminated && len(block.Ops) < 64 {
+		insnStart := curPC
 		b, err := mem.Read8(curPC)
 		if err != nil {
 			return nil, err
@@ -253,7 +240,17 @@ func (t *Translator) Compile(pc uint64, mem cpu.Memory) (*BasicBlock, error) {
 			if rexB {
 				rm += 8
 			}
-			block.Ops = append(block.Ops, IROp{Type: OpAddReg, DstReg: rm, SrcReg: reg})
+			if modrm>>6 != 3 {
+				// ponytail: memory-operand form left to interpreter; upgrade: emit load/store IR
+				curPC = insnStart
+				terminated = true
+				break
+			}
+			sz := 4
+			if rexW {
+				sz = 8
+			}
+			block.Ops = append(block.Ops, IROp{Type: OpAddReg, DstReg: rm, SrcReg: reg, Size: sz})
 
 		case 0x29: // SUB r/m, r
 			curPC++
@@ -270,7 +267,17 @@ func (t *Translator) Compile(pc uint64, mem cpu.Memory) (*BasicBlock, error) {
 			if rexB {
 				rm += 8
 			}
-			block.Ops = append(block.Ops, IROp{Type: OpSubReg, DstReg: rm, SrcReg: reg})
+			if modrm>>6 != 3 {
+				// ponytail: memory-operand form left to interpreter; upgrade: emit load/store IR
+				curPC = insnStart
+				terminated = true
+				break
+			}
+			sz := 4
+			if rexW {
+				sz = 8
+			}
+			block.Ops = append(block.Ops, IROp{Type: OpSubReg, DstReg: rm, SrcReg: reg, Size: sz})
 
 		case 0x31: // XOR r/m, r
 			curPC++
@@ -287,7 +294,17 @@ func (t *Translator) Compile(pc uint64, mem cpu.Memory) (*BasicBlock, error) {
 			if rexB {
 				rm += 8
 			}
-			block.Ops = append(block.Ops, IROp{Type: OpXorReg, DstReg: rm, SrcReg: reg})
+			if modrm>>6 != 3 {
+				// ponytail: memory-operand form left to interpreter; upgrade: emit load/store IR
+				curPC = insnStart
+				terminated = true
+				break
+			}
+			sz := 4
+			if rexW {
+				sz = 8
+			}
+			block.Ops = append(block.Ops, IROp{Type: OpXorReg, DstReg: rm, SrcReg: reg, Size: sz})
 
 		case 0xEB: // JMP rel8
 			curPC++
@@ -330,11 +347,14 @@ func (t *Translator) Compile(pc uint64, mem cpu.Memory) (*BasicBlock, error) {
 				block.Ops = append(block.Ops, IROp{Type: OpSyscall})
 				terminated = true
 			} else {
-				return nil, fmt.Errorf("unsupported 2-byte opcode: 0x0F 0x%02x", b2)
+				// leave the whole escape byte sequence to the interpreter
+				curPC = insnStart
+				terminated = true
 			}
 
 		default:
-			// Fallback: stop block compilation here
+			// Fallback: rewind (REX byte already consumed) and let Step decode it
+			curPC = insnStart
 			terminated = true
 		}
 	}
@@ -342,4 +362,13 @@ func (t *Translator) Compile(pc uint64, mem cpu.Memory) (*BasicBlock, error) {
 	block.ByteLen = curPC - pc
 	t.Cache.Put(pc, block)
 	return block, nil
+}
+
+// jitSize maps IROp size to operand width; unset sizes default to 32-bit (no-REX forms).
+func jitSize(sz int) int {
+	switch sz {
+	case 1, 2, 8:
+		return sz
+	}
+	return 4
 }

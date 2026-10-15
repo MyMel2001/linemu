@@ -97,6 +97,10 @@ func NewVM(ramBytes uint64, numCores int) *VM {
 	cpus := make([]*cpu.CPUState, numCores)
 	for i := 0; i < numCores; i++ {
 		cpus[i] = cpu.NewCPUState()
+		if i > 0 {
+			// Application processors stay halted until MP bring-up (no SIPI path yet)
+			cpus[i].Halted = true
+		}
 	}
 
 	vm := &VM{
@@ -257,15 +261,15 @@ func (v *VM) Run(maxInstructions int) error {
 
 	for coreID := 0; coreID < len(v.CPUs); coreID++ {
 		wg.Add(1)
-		go func(c *cpu.CPUState) {
+		go func(id int, c *cpu.CPUState) {
 			defer wg.Done()
 			for i := 0; (maxInstructions <= 0 || i < maxInstructions) && !c.Halted; i++ {
 				if err := v.stepCPU(c); err != nil {
-					errs <- err
+					errs <- fmt.Errorf("vCPU %d: %w", id, err)
 					return
 				}
 			}
-		}(v.CPUs[coreID])
+		}(coreID, v.CPUs[coreID])
 	}
 
 	wg.Wait()
@@ -347,14 +351,12 @@ func main() {
 	}
 
 	bootStatus := "No bootable media specified (System Idle / Halted)"
-	booted := false
 	if slot > 0 {
 		bootDrive, bootMethod, err := vm.Boot()
 		if err != nil {
 			bootStatus = fmt.Sprintf("Boot failed: %v", err)
 			fmt.Printf("Notice: boot sequence: %v\n", err)
 		} else {
-			booted = true
 			info, _ := vm.Storage.GetDriveInfo(bootDrive)
 			bootStatus = fmt.Sprintf("Booted via %s from Drive %d (Unique ID: %s, RIP: 0x%X)",
 				bootMethod, bootDrive, info.UniqueID, vm.CPU().RIP)
@@ -368,15 +370,6 @@ func main() {
 	}
 
 	vm.DRM.RenderBootScreen(ramBytes/(1024*1024), *cores, *displayMode, bootStatus)
-
-	// Clear UEFI splash after brief display so guest framebuffer takes over
-	if booted {
-		go func() {
-			time.Sleep(2 * time.Second)
-			vm.DRM.FillRect(0, 0, vm.DRM.Width, vm.DRM.Height, 0, 0, 0)
-			vm.DRM.Flush()
-		}()
-	}
 
 	renderer := graphics.NewDisplayRenderer(graphics.DisplayMode(*displayMode), vm.DRM.Width, vm.DRM.Height)
 	renderer.AttachInput(vm.PS2)
@@ -413,7 +406,15 @@ func main() {
 
 	vmDone := make(chan struct{})
 	go func() {
-		_ = vm.Run(0)
+		if err := vm.Run(0); err != nil {
+			// Surface guest fault instead of silently going black/idle
+			fmt.Fprintf(os.Stderr, "\nLinEMU: guest vCPU fault: %v\n", err)
+			vm.DRM.FillRect(60, vm.DRM.Height/2-70, vm.DRM.Width-120, 140, 0x30, 0x00, 0x00)
+			vm.DRM.DrawText(90, vm.DRM.Height/2-50, "GUEST CPU FAULT - EMULATION STOPPED", 0xFF, 0x66, 0x66, 3)
+			vm.DRM.DrawText(90, vm.DRM.Height/2, err.Error(), 0xFF, 0xCC, 0xCC, 1)
+			vm.DRM.Flush()
+			return // keep display alive for diagnosis; exit via signal
+		}
 		close(vmDone)
 	}()
 

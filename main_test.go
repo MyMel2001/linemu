@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"linemu/pkg/bus"
 	"linemu/pkg/cpu"
 	"linemu/pkg/devices"
 	"linemu/pkg/graphics"
@@ -9,6 +10,7 @@ import (
 	"linemu/pkg/uefi"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -85,6 +87,7 @@ func TestMultiCoreExecution(t *testing.T) {
 
 	for i := 1; i < 4; i++ {
 		vm.CPUs[i].RIP = 0
+		vm.CPUs[i].Halted = false // APs start halted; release for MP test
 	}
 
 	if err := vm.Run(10); err != nil {
@@ -368,7 +371,7 @@ func TestPS2KeyboardAndMouse(t *testing.T) {
 	b0, _ := vm.IO.In(0x60, 1)
 	b1, _ := vm.IO.In(0x60, 1)
 	b2, _ := vm.IO.In(0x60, 1)
-	if (b0 & 0x01) != 0x01 || (b0 & 0x08) != 0x08 || (b0 & 0x20) == 0 { // Y sign bit set since dy < 0
+	if (b0&0x01) != 0x01 || (b0&0x08) != 0x08 || (b0&0x20) == 0 { // Y sign bit set since dy < 0
 		t.Errorf("unexpected mouse packet header: 0x%02x", b0)
 	}
 	if int8(b1) != 15 || int8(b2) != -10 {
@@ -504,5 +507,371 @@ func TestUEFIBootSequenceAndOrder(t *testing.T) {
 	}
 	if bootID != 0 {
 		t.Errorf("expected fallback to Drive 0, got Drive %d (method=%s)", bootID, method)
+	}
+}
+
+func TestGuestFaultSurfaces(t *testing.T) {
+	vm := NewVM(1024*1024, 1)
+
+	// 0x06 (PUSH ES) is invalid in 64-bit mode — must surface as a fault.
+	// (Common EFI prologue 48 83 EC 28 now executes; see TestBatchDecode.)
+	code := []byte{0x06, 0xF4}
+	if err := vm.MMU.LoadBytes(0x1000, code); err != nil {
+		t.Fatalf("LoadBytes: %v", err)
+	}
+	vm.CPU().RIP = 0x1000
+
+	err := vm.Run(100)
+	if err == nil {
+		t.Fatal("expected vCPU fault for unsupported opcode, got nil")
+	}
+	if !strings.Contains(err.Error(), "vCPU 0") || !strings.Contains(err.Error(), "unsupported opcode") {
+		t.Errorf("expected attributed unsupported-opcode fault, got: %v", err)
+	}
+}
+
+func TestAndALImm8(t *testing.T) {
+	vm := NewVM(1024*1024, 1)
+
+	// MOV EAX,0xF0; AND AL,0x3C; HLT  -> AL=0x30, ZF clear
+	code := []byte{0xB8, 0xF0, 0x00, 0x00, 0x00, 0x24, 0x3C, 0xF4}
+	if err := vm.MMU.LoadBytes(0x2000, code); err != nil {
+		t.Fatalf("LoadBytes: %v", err)
+	}
+	vm.CPU().RIP = 0x2000
+
+	if err := vm.Run(20); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if uint8(vm.CPU().Regs[cpu.RAX]) != 0x30 {
+		t.Errorf("expected AL=0x30, got 0x%02X", uint8(vm.CPU().Regs[cpu.RAX]))
+	}
+	if vm.CPU().GetZF() {
+		t.Errorf("expected ZF clear")
+	}
+	if vm.CPU().RFLAGS&cpu.FLAG_CF != 0 {
+		t.Errorf("expected CF clear after AND")
+	}
+}
+
+// TestBatchDecode runs a hand-assembled program exercising the batch x86_64
+// decoder: REX.W forms, RIP-relative LEA, group1/2/3/5, setcc/cmov-era jcc,
+// call/ret, push/pop, CPUID, RDTSC, and rep stosq.
+func TestBatchDecode(t *testing.T) {
+	vm := NewVM(16*1024*1024, 1)
+
+	base := uint64(0x1000)
+	code := []byte{
+		0x48, 0xC7, 0xC0, 0x10, 0x00, 0x00, 0x00, // 0x00 mov rax, 0x10
+		0x55,                                     // 0x07 push rbp
+		0x48, 0x89, 0xE5,                         // 0x08 mov rbp, rsp
+		0x48, 0x83, 0xEC, 0x20,                   // 0x0B sub rsp, 0x20
+		0x48, 0x89, 0x45, 0xF8,                   // 0x0F mov [rbp-8], rax
+		0x48, 0x8B, 0x5D, 0xF8,                   // 0x13 mov rbx, [rbp-8]
+		0x48, 0x83, 0xFB, 0x10,                   // 0x17 cmp rbx, 0x10
+		0x0F, 0x94, 0xC0,                         // 0x1B sete al
+		0x0F, 0xB6, 0xC8,                         // 0x1E movzx ecx, al
+		0xC1, 0xE1, 0x02,                         // 0x21 shl ecx, 2
+		0x6B, 0xC9, 0x03,                         // 0x24 imul ecx, ecx, 3
+		0x4C, 0x8D, 0x2D, 0x40, 0x00, 0x00, 0x00, // 0x27 lea r13, [rip+0x40] -> 0x106E
+		0xB8, 0xEF, 0xBE, 0xAD, 0xDE,             // 0x2E mov eax, 0xDEADBEEF
+		0x48, 0xC1, 0xC0, 0x10,                   // 0x33 rol rax, 16
+		0x50,                                     // 0x37 push rax
+		0x58,                                     // 0x38 pop rax
+		0xE8, 0x52, 0x00, 0x00, 0x00,             // 0x39 call 0x90 (stub)
+		0xB9, 0x07, 0x00, 0x00, 0x00,             // 0x3E mov ecx, 7
+		0x83, 0xF9, 0x07,                         // 0x43 cmp ecx, 7
+		0x74, 0x03,                               // 0x46 je 0x4B (taken, skips marker)
+		0x41, 0xB5, 0xEE,                         // 0x48 mov r13b, 0xEE (must not run)
+		0x0F, 0x9D, 0xC1,                         // 0x4B setge cl
+		0x0F, 0xB7, 0xD9,                         // 0x4E movzx ebx, cl
+		0xF6, 0xE1,                               // 0x51 mul cl
+		0xD1, 0xE1,                               // 0x53 shl ecx, 1
+		0x01, 0xD9,                               // 0x55 add ecx, ebx
+		0x83, 0xF9, 0x03,                         // 0x57 cmp ecx, 3
+		0x75, 0x2B,                               // 0x5A jne 0x87 (hlt; must not be taken)
+		0xBF, 0x00, 0x20, 0x00, 0x00,             // 0x5C mov edi, 0x2000
+		0x48, 0xB8, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, // 0x61 mov rax, 0x4141...
+		0x48, 0xC7, 0xC1, 0x03, 0x00, 0x00, 0x00, // 0x6B mov rcx, 3
+		0xF3, 0x48, 0xAB,                         // 0x72 rep stosq
+		0xB8, 0x00, 0x00, 0x00, 0x00,             // 0x75 mov eax, 0
+		0x0F, 0xA2,                               // 0x7A cpuid
+		0x0F, 0x31,                               // 0x7C rdtsc
+		0xB8, 0xEF, 0xBE, 0xAD, 0xDE,             // 0x7E mov eax, 0xDEADBEEF
+		0x48, 0xC1, 0xC0, 0x10,                   // 0x83 rol rax, 16
+		0xF4, // 0x87 hlt
+	}
+	stub := []byte{
+		0x41, 0xB4, 0x99, // 0x90 mov r12b, 0x99
+		0xC3, // 0x93 ret
+	}
+	if err := vm.MMU.LoadBytes(base, code); err != nil {
+		t.Fatalf("LoadBytes: %v", err)
+	}
+	if err := vm.MMU.LoadBytes(base+0x90, stub); err != nil {
+		t.Fatalf("LoadBytes stub: %v", err)
+	}
+
+	c := vm.CPU()
+	c.RIP = base
+	c.Regs[cpu.RSP] = 0x7FFFF0
+	if err := vm.Run(100000); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !c.Halted {
+		t.Fatal("expected HLT")
+	}
+
+	want := map[int]uint64{
+		cpu.RAX: 0xDEADBEEF0000,     // mov eax + rol rax,16 (0xDEADBEEF<<16, top bits were 0)
+		cpu.RBX: 0x756E6547,         // cpuid leaf 0 vendor "Genu"
+		cpu.RCX: 0x6C65746E,         // cpuid vendor "ntel" (rep stosq emptied rcx first)
+		cpu.RDI: 0x2018,             // 3 rep stosq iterations
+		cpu.R12: 0x99,               // call/ret reached stub
+		cpu.R13: 0x106E,             // rip-relative lea; skipped marker byte proves je taken
+		cpu.RBP: 0x7FFFE8,           // mov rbp, rsp after push rbp
+		cpu.RSP: 0x7FFFC8,           // push/pop/call/ret net -0x28
+	}
+	for reg, exp := range want {
+		if c.Regs[reg] != exp {
+			t.Errorf("reg[%d] = 0x%X, want 0x%X", reg, c.Regs[reg], exp)
+		}
+	}
+
+	// stack slot written in prologue: mov [rbp-8], rax (rax was 0x10)
+	v, err := vm.MMU.Read64(0x7FFFE0)
+	if err != nil || v != 0x10 {
+		t.Errorf("[rbp-8] = 0x%X, err=%v, want 0x10", v, err)
+	}
+	// rep stosq fill
+	for i := 0; i < 24; i++ {
+		b, err := vm.MMU.Read8(0x2000 + uint64(i))
+		if err != nil || b != 0x41 {
+			t.Fatalf("mem[0x2000+%d] = 0x%X, err=%v, want 0x41", i, b, err)
+		}
+	}
+}
+
+type testIODev struct{ buf []byte }
+
+func (d *testIODev) Read(port uint16, size int) (uint32, error) { return 0xAB, nil }
+func (d *testIODev) Write(port uint16, val uint32, size int) error {
+	d.buf = append(d.buf, byte(val))
+	return nil
+}
+
+var _ bus.Device = (*testIODev)(nil)
+
+// TestStringIO covers INS/OUTS with REP (0x6C-0x6F).
+func TestStringIO(t *testing.T) {
+	vm := NewVM(1024*1024, 1)
+	dev := &testIODev{}
+	vm.IO.Register(0xE9, dev)
+
+	base := uint64(0x1000)
+	code := []byte{
+		0xBA, 0xE9, 0x00, 0x00, 0x00, // mov dx, 0xE9
+		0xBE, 0x00, 0x20, 0x00, 0x00, // mov esi, 0x2000
+		0xBF, 0x00, 0x30, 0x00, 0x00, // mov edi, 0x3000
+		0xB9, 0x04, 0x00, 0x00, 0x00, // mov ecx, 4
+		0xF3, 0x6E,                   // rep outsb
+		0xBE, 0x00, 0x40, 0x00, 0x00, // mov esi, 0x4000
+		0xB9, 0x04, 0x00, 0x00, 0x00, // mov ecx, 4
+		0xF3, 0x6C,                   // rep insb
+		0x6E,                         // outsb (single)
+		0xF4,                         // hlt
+	}
+	if err := vm.MMU.LoadBytes(base, code); err != nil {
+		t.Fatalf("LoadBytes: %v", err)
+	}
+	for i, v := range []byte{0x11, 0x22, 0x33, 0x44} {
+		if err := vm.MMU.Write8(0x2000+uint64(i), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := vm.MMU.Write8(0x4000, 0x77); err != nil {
+		t.Fatal(err)
+	}
+
+	c := vm.CPU()
+	c.RIP = base
+	if err := vm.Run(1000); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := []byte{0x11, 0x22, 0x33, 0x44, 0x77}
+	if !bytes.Equal(dev.buf, want) {
+		t.Errorf("device got % X, want % X", dev.buf, want)
+	}
+	if c.Regs[cpu.RSI] != 0x4001 {
+		t.Errorf("RSI = 0x%X, want 0x4001", c.Regs[cpu.RSI])
+	}
+	if c.Regs[cpu.RDI] != 0x3004 {
+		t.Errorf("RDI = 0x%X, want 0x3004", c.Regs[cpu.RDI])
+	}
+	if c.Regs[cpu.RCX] != 0 {
+		t.Errorf("RCX = %d, want 0", c.Regs[cpu.RCX])
+	}
+	for i := 0; i < 4; i++ {
+		b, err := vm.MMU.Read8(0x3000 + uint64(i))
+		if err != nil || b != 0xAB {
+			t.Fatalf("mem[0x3000+%d] = 0x%X, err=%v, want 0xAB", i, b, err)
+		}
+	}
+	if !c.Halted {
+		t.Fatal("expected HLT")
+	}
+}
+
+func runSnippet(t *testing.T, code []byte, setup map[uint64][]byte) *VM {
+	t.Helper()
+	vm := NewVM(16*1024*1024, 1)
+	base := uint64(0x1000)
+	if err := vm.MMU.LoadBytes(base, code); err != nil {
+		t.Fatalf("LoadBytes: %v", err)
+	}
+	for addr, data := range setup {
+		if err := vm.MMU.LoadBytes(addr, data); err != nil {
+			t.Fatalf("LoadBytes data @0x%X: %v", addr, err)
+		}
+	}
+	c := vm.CPU()
+	c.RIP = base
+	c.Regs[cpu.RSP] = 0x7FFFF0
+	if err := vm.Run(10000); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !c.Halted {
+		t.Fatal("expected HLT")
+	}
+	return vm
+}
+
+// TestX87Compare covers faddp/fstp/fcom + fnstsw + sahf (compiler compare pattern).
+func TestX87Compare(t *testing.T) {
+	code := []byte{
+		0xD9, 0xE8, // fld1
+		0xD9, 0xEE, // fldz
+		0xDE, 0xC1, // faddp st(1), st(0) -> 1.0
+		0xDD, 0x1C, 0x25, 0x00, 0x20, 0x00, 0x00, // fstp qword [0x2000]
+		0xD9, 0xE8, // fld1
+		0xD9, 0xE8, // fld1
+		0xD8, 0xD1, // fcom st(1) -> equal, sets C3
+		0xDF, 0xE0, // fnstsw ax
+		0x9E,       // sahf (ZF <- C3)
+		0x0F, 0x94, 0xC1, // sete cl
+		0xF4,
+	}
+	vm := runSnippet(t, code, nil)
+	c := vm.CPU()
+	v, err := vm.MMU.Read64(0x2000)
+	if err != nil || v != 0x3FF0000000000000 {
+		t.Errorf("fstp [0x2000] = 0x%X err=%v, want float64(1.0)", v, err)
+	}
+	if c.Regs[cpu.RAX]&0xFFFF != 0x4000 {
+		t.Errorf("AX = 0x%X, want 0x4000 (C3 set)", c.Regs[cpu.RAX]&0xFFFF)
+	}
+	if c.Regs[cpu.RCX]&0xFF != 1 {
+		t.Errorf("CL = %d, want 1 (ZF after sahf)", c.Regs[cpu.RCX]&0xFF)
+	}
+}
+
+// TestSSEAddSS covers movss/addss round-trip through memory.
+func TestSSEAddSS(t *testing.T) {
+	code := []byte{
+		0xF3, 0x0F, 0x10, 0x04, 0x25, 0x00, 0x21, 0x00, 0x00, // movss xmm0, [0x2100]
+		0xF3, 0x0F, 0x10, 0x0C, 0x25, 0x04, 0x21, 0x00, 0x00, // movss xmm1, [0x2104]
+		0xF3, 0x0F, 0x58, 0xC1,                               // addss xmm0, xmm1
+		0xF3, 0x0F, 0x11, 0x04, 0x25, 0x00, 0x21, 0x00, 0x00, // movss [0x2100], xmm0
+		0xF4,
+	}
+	data := make([]byte, 8)
+	copy(data[0:], []byte{0x00, 0x00, 0xC0, 0x3F}) // 1.5f
+	copy(data[4:], []byte{0x00, 0x00, 0x10, 0x40}) // 2.25f
+	vm := runSnippet(t, code, map[uint64][]byte{0x2100: data})
+	v, err := vm.MMU.Read32(0x2100)
+	if err != nil || v != 0x40700000 {
+		t.Errorf("addss result = 0x%X err=%v, want 0x40700000 (3.75f)", v, err)
+	}
+}
+
+// TestLARLSL covers 0F 02/03 against a hand-built GDT plus LGDT (0F 01).
+func TestLARLSL(t *testing.T) {
+	code := []byte{
+		0x0F, 0x01, 0x14, 0x25, 0x00, 0x30, 0x00, 0x00, // lgdt [0x3000]
+		0xB9, 0x08, 0x00, 0x00, 0x00,                   // mov ecx, 8
+		0x0F, 0x02, 0xC1,                               // lar eax, ecx
+		0x48, 0x0F, 0x03, 0xD1,                         // lsl rdx, rcx
+		0xF4,
+	}
+	gdt := make([]byte, 10) // LGDT operand: limit + base (points at table 0x3010)
+	copy(gdt[0:], []byte{0x17, 0x00})
+	copy(gdt[2:], []byte{0x10, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	table := make([]byte, 16) // GDT: null entry + code descriptor at +8 (selector 0x08)
+	copy(table[8:], []byte{0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xAF, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	vm := runSnippet(t, code, map[uint64][]byte{0x3000: gdt, 0x3010: table})
+	c := vm.CPU()
+	if c.Regs[cpu.RAX] != 0x00AF9A00 {
+		t.Errorf("LAR = 0x%X, want 0x00AF9A00", c.Regs[cpu.RAX])
+	}
+	if c.Regs[cpu.RDX] != 0xFFFFFFFF {
+		t.Errorf("LSL = 0x%X, want 0xFFFFFFFF", c.Regs[cpu.RDX])
+	}
+}
+
+// TestSSSE3Pshufb covers the 0F 38 three-byte map.
+func TestSSSE3Pshufb(t *testing.T) {
+	code := []byte{
+		0xF3, 0x0F, 0x6F, 0x04, 0x25, 0x00, 0x40, 0x00, 0x00, // movdqu xmm0, [0x4000]
+		0xF3, 0x0F, 0x6F, 0x0C, 0x25, 0x00, 0x41, 0x00, 0x00, // movdqu xmm1, [0x4100]
+		0x66, 0x0F, 0x38, 0x00, 0xC1,                         // pshufb xmm0, xmm1
+		0xF3, 0x0F, 0x7F, 0x04, 0x25, 0x00, 0x50, 0x00, 0x00, // movdqu [0x5000], xmm0
+		0xF4,
+	}
+	data := make([]byte, 16)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	mask := []byte{0x00, 0x80, 0x0F, 0x04, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
+	vm := runSnippet(t, code, map[uint64][]byte{0x4000: data, 0x4100: mask})
+	want := []byte{0x00, 0x00, 0x0F, 0x04, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
+	got := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		b, err := vm.MMU.Read8(0x5000 + uint64(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[i] = b
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("pshufb result = % X, want % X", got, want)
+	}
+}
+
+// TestBTBTS covers 0F A3 (BT) / 0F AB (BTS) and CF via SETcc.
+func TestBTBTS(t *testing.T) {
+	code := []byte{
+		0x48, 0x31, 0xC0, // xor rax, rax
+		0x48, 0xC7, 0xC3, 0x04, 0x00, 0x00, 0x00, // mov rbx, 4
+		0x0F, 0xA3, 0xD8, // bt rax, rbx (bit clear -> CF=0)
+		0x0F, 0x92, 0xC1, // setc cl
+		0x0F, 0xAB, 0xD8, // bts rax, rbx (set bit 4)
+		0x0F, 0xA3, 0xD8, // bt rax, rbx (bit set -> CF=1)
+		0x0F, 0x92, 0xC2, // setc dl
+		0xF4,
+	}
+	vm := runSnippet(t, code, nil)
+	c := vm.CPU()
+	if c.Regs[cpu.RAX] != 0x10 {
+		t.Errorf("RAX = 0x%X, want 0x10 (bts set bit 4)", c.Regs[cpu.RAX])
+	}
+	if c.Regs[cpu.RCX]&0xFF != 0 {
+		t.Errorf("CL = %d, want 0 (CF clear before bts)", c.Regs[cpu.RCX]&0xFF)
+	}
+	if c.Regs[cpu.RDX]&0xFF != 1 {
+		t.Errorf("DL = %d, want 1 (CF set after bts)", c.Regs[cpu.RDX]&0xFF)
 	}
 }

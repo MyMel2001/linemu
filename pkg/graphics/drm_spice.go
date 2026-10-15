@@ -60,7 +60,6 @@ func NewKernelDRMBridge() *KernelDRMBridge {
 		Framebuffer:   make([]byte, fbSize),
 		Renderer:      NewDisplayRenderer(DisplayWindow, w, h),
 	}
-	k.RenderBootScreen(64, 1, "window", "LinEmu UEFI Initializing...")
 	k.BARSizes[0] = 0x4000000 // 64MB Framebuffer
 	k.BARSizes[1] = 0x2000000 // 32MB Command / Surface RAM
 	k.BARSizes[2] = 0x2000    // 8KB MMIO / I/O space
