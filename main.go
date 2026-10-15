@@ -347,12 +347,14 @@ func main() {
 	}
 
 	bootStatus := "No bootable media specified (System Idle / Halted)"
+	booted := false
 	if slot > 0 {
 		bootDrive, bootMethod, err := vm.Boot()
 		if err != nil {
 			bootStatus = fmt.Sprintf("Boot failed: %v", err)
 			fmt.Printf("Notice: boot sequence: %v\n", err)
 		} else {
+			booted = true
 			info, _ := vm.Storage.GetDriveInfo(bootDrive)
 			bootStatus = fmt.Sprintf("Booted via %s from Drive %d (Unique ID: %s, RIP: 0x%X)",
 				bootMethod, bootDrive, info.UniqueID, vm.CPU().RIP)
@@ -366,6 +368,15 @@ func main() {
 	}
 
 	vm.DRM.RenderBootScreen(ramBytes/(1024*1024), *cores, *displayMode, bootStatus)
+
+	// Clear UEFI splash after brief display so guest framebuffer takes over
+	if booted {
+		go func() {
+			time.Sleep(2 * time.Second)
+			vm.DRM.FillRect(0, 0, vm.DRM.Width, vm.DRM.Height, 0, 0, 0)
+			vm.DRM.Flush()
+		}()
+	}
 
 	renderer := graphics.NewDisplayRenderer(graphics.DisplayMode(*displayMode), vm.DRM.Width, vm.DRM.Height)
 	renderer.AttachInput(vm.PS2)
