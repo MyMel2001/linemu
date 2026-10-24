@@ -33,6 +33,7 @@ const (
 	HandleGOP     uint64 = 0xE0030001
 	HandleConOut  uint64 = 0xE0030002
 	HandleConIn   uint64 = 0xE0030003
+	HandleBootVol uint64 = 0xE0030004
 	HandleBaseSeq uint64 = 0xE0030010
 	EventBaseSeq  uint64 = 0xE0020002
 )
@@ -41,6 +42,8 @@ const (
 const (
 	EFIStatusBufferTooSmall    uint64 = 0x8000000000000005
 	EFIStatusNotReady          uint64 = 0x8000000000000006
+	EFIStatusDeviceError       uint64 = 0x8000000000000007
+	EFIStatusWriteProtected    uint64 = 0x8000000000000008
 	EFIStatusOutOfResources    uint64 = 0x8000000000000009
 	EFIStatusTimeout           uint64 = 0x8000000000000012
 	EFIStatusInvalidParameter2 uint64 = 0x8000000000000002 // alias, same as EFIStatusInvalidParameter
@@ -100,6 +103,23 @@ const (
 	svcSetVariable         = EFIHypercallBase + 84
 	svcGetNextHighMono     = EFIHypercallBase + 85
 	svcResetSystem         = EFIHypercallBase + 86
+	svcBlockReset          = EFIHypercallBase + 88
+	svcBlockRead           = EFIHypercallBase + 89
+	svcBlockWrite          = EFIHypercallBase + 90
+	svcBlockFlush          = EFIHypercallBase + 91
+	svcFSOpenVolume        = EFIHypercallBase + 92
+	svcFileOpen            = EFIHypercallBase + 93
+	svcFileClose           = EFIHypercallBase + 94
+	svcFileRead            = EFIHypercallBase + 95
+	svcFileWrite           = EFIHypercallBase + 96
+	svcFileGetInfo         = EFIHypercallBase + 97
+	svcFileSetPos          = EFIHypercallBase + 98
+	svcFileGetPos          = EFIHypercallBase + 99
+	svcFileFlush           = EFIHypercallBase + 100
+	svcLoadImage           = EFIHypercallBase + 101
+	svcStartImage          = EFIHypercallBase + 102
+	svcUnloadImage         = EFIHypercallBase + 103
+	svcLocateDevicePath    = EFIHypercallBase + 104
 )
 
 type efiEvent struct {
@@ -122,6 +142,12 @@ type fwGlobals struct {
 	events  map[uint64]*efiEvent
 	vars    map[string]*efiVar
 	configs [][2]any // (guid [16]byte, table uint64)
+
+	bootDev devices.BlockStorage
+	bootFAT uint64 // boot FAT start LBA (512-byte units)
+	files   map[uint64]*fatFile
+	images  map[uint64]uint64 // image handle -> entry point
+	allocs  [][2]uint64       // explicit AllocateAddress ranges [base,end)
 }
 
 var fwState = &fwGlobals{
@@ -142,11 +168,19 @@ func ResetFirmwareState(ram *mmu.RAM) {
 	fwState.events = make(map[uint64]*efiEvent)
 	fwState.vars = make(map[string]*efiVar)
 	fwState.configs = nil
+	fwState.files = make(map[uint64]*fatFile)
+	fwState.images = make(map[uint64]uint64)
+	fwState.allocs = nil
 
 	fwState.protos[HandleGOP] = map[[16]byte]uint64{gopGUID: GOPProtocolAddr}
 	fwState.protos[HandleConOut] = map[[16]byte]uint64{textOutGUID: ConOutBaseAddr}
 	fwState.protos[HandleConIn] = map[[16]byte]uint64{textInGUID: ConInAddr}
 	fwState.protos[LoadedImageBaseAddr] = map[[16]byte]uint64{loadedImgGUID: LoadedImageBaseAddr}
+	fwState.protos[HandleBootVol] = map[[16]byte]uint64{
+		devicePathGUID: DevicePathAddr,
+		blockIoGUID:    BlockIoAddr,
+		simpleFSGUID:   SimpleFSAddr,
+	}
 	fwState.events[EvtConInKey] = &efiEvent{}
 
 	top := ram.Size() &^ 0xFFF
@@ -184,14 +218,34 @@ func readGUID(ram *mmu.RAM, addr uint64) ([16]byte, error) {
 	return g, nil
 }
 
-// allocBump carves size bytes (aligned up) out of the firmware pool.
+// allocBump carves size bytes (aligned up) out of the firmware pool,
+// skipping the loaded image and explicit AllocateAddress ranges.
 func allocBump(ram *mmu.RAM, size, align uint64) (uint64, error) {
 	if align == 0 {
 		align = 8
 	}
 	next, _ := ram.Read64(AllocNextAddr)
 	end, _ := ram.Read64(AllocEndAddr)
+	imgBase, _ := ram.Read64(LoadedImageBaseAddr + 64)
+	imgSize, _ := ram.Read64(LoadedImageBaseAddr + 72)
 	addr := (next + align - 1) &^ (align - 1)
+	// Skip forbidden ranges; loop since skipping one may land in another.
+	for {
+		skipped := false
+		if imgBase != 0 && imgSize != 0 && addr < imgBase+imgSize && addr+size > imgBase {
+			addr = (imgBase + imgSize + align - 1) &^ (align - 1)
+			skipped = true
+		}
+		for _, a := range fwState.allocs {
+			if addr < a[1] && addr+size > a[0] {
+				addr = (a[1] + align - 1) &^ (align - 1)
+				skipped = true
+			}
+		}
+		if !skipped {
+			break
+		}
+	}
 	if addr+size < addr || addr+size > end {
 		return 0, errNoMem
 	}
@@ -238,7 +292,37 @@ func svcAllocPages(state *cpu.CPUState, ram *mmu.RAM) error {
 			state.Regs[cpu.RAX] = EFIStatusNotFound
 			return nil
 		}
+		next, _ := ram.Read64(AllocNextAddr)
+		_ = next
+		imgBase, _ := ram.Read64(LoadedImageBaseAddr + 64)
+		imgSize, _ := ram.Read64(LoadedImageBaseAddr + 72)
+		fbBase, _ := ram.Read64(GOPModeAddr + 24)
+		fbSize, _ := ram.Read64(GOPModeAddr + 32)
+		overlap := func(b, e uint64) bool { return req < e && req+size > b }
+		// ponytail: allow AllocateAddress inside bump high-water; freed pages are reused via this path.
+		if imgBase != 0 && imgSize != 0 && overlap(imgBase, imgBase+imgSize) {
+			state.Regs[cpu.RAX] = EFIStatusNotFound
+			return nil
+		}
+		if fbBase != 0 && fbSize != 0 && overlap(fbBase&^0xFFF, ((fbBase+fbSize+0xFFF)&^0xFFF)) {
+			// Only reject if fb inside RAM; MMIO above top never overlaps valid req.
+			if fbBase < uint64(ram.Size()) {
+				state.Regs[cpu.RAX] = EFIStatusNotFound
+				return nil
+			}
+		}
 		addr = req
+		already := false
+		for _, a := range fwState.allocs {
+			if overlap(a[0], a[1]) {
+				already = true
+				break
+			}
+		}
+		if !already {
+			fwState.allocs = append(fwState.allocs, [2]uint64{req, req + size})
+		}
+		bumpMapKey(ram)
 	default: // AllocateAnyPages / AllocateMaxAddress
 		a, err := allocBump(ram, size, 4096)
 		if err != nil {
@@ -288,22 +372,77 @@ func memMapEntries(ram *mmu.RAM) []memDesc {
 	next, _ := ram.Read64(AllocNextAddr)
 	fbBase, _ := ram.Read64(GOPModeAddr + 24)
 	fbSize, _ := ram.Read64(GOPModeAddr + 32)
+	imgBase, _ := ram.Read64(LoadedImageBaseAddr + 64)
+	imgSize, _ := ram.Read64(LoadedImageBaseAddr + 72)
 	out := []memDesc{
 		{typ: 7, start: 0, pages: 256},
 		{typ: 0, start: 0x100000, pages: 256},
 	}
+	// Reserved ranges inside [0x200000, top): loaded image + fb + AllocateAddress.
+	// ponytail: only initial image + fb + AllocateAddress carved; dynamic LoadImage ranges not tracked.
+	type rng struct {
+		base, end uint64
+		typ       uint32
+		attr      uint64
+	}
+	var reserved []rng
+	addRsv := func(b, e uint64, typ uint32, attr uint64) {
+		b &= ^uint64(0xFFF)
+		e = (e + 0xFFF) &^ 0xFFF
+		if b < 0x200000 {
+			b = 0x200000
+		}
+		if e > top {
+			e = top
+		}
+		if e > b && b < top {
+			reserved = append(reserved, rng{b, e, typ, attr})
+			out = append(out, memDesc{typ: typ, start: b, pages: (e - b) / 4096, attr: attr})
+		}
+	}
+	if imgBase != 0 && imgSize != 0 {
+		addRsv(imgBase, imgBase+imgSize, 2, 0)
+	}
+	if fbBase != 0 && fbSize != 0 {
+		addRsv(fbBase, fbBase+fbSize, 11, 0x1)
+	}
+	for _, a := range fwState.allocs {
+		addRsv(a[0], a[1], 4, 0)
+	}
+	// insertion sort: <=4 entries.
+	for i := 1; i < len(reserved); i++ {
+		for j := i; j > 0 && reserved[j].base < reserved[j-1].base; j-- {
+			reserved[j], reserved[j-1] = reserved[j-1], reserved[j]
+		}
+	}
+	// Emit runs in [base,end) minus reserved.
+	emitMinus := func(base, end uint64, typ uint32) {
+		cur := base
+		for _, r := range reserved {
+			if r.base >= end || r.end <= cur {
+				continue
+			}
+			if r.base > cur {
+				out = append(out, memDesc{typ: typ, start: cur, pages: (r.base - cur) / 4096})
+			}
+			if r.end > cur {
+				cur = r.end
+			}
+		}
+		if cur < end {
+			out = append(out, memDesc{typ: typ, start: cur, pages: (end - cur) / 4096})
+		}
+	}
 	if next > 0x200000 && next < top {
-		out = append(out, memDesc{typ: 4, start: 0x200000, pages: (next - 0x200000) / 4096})
+		emitMinus(0x200000, next&^0xFFF, 4)
 	}
 	freeBase := next
 	if freeBase < 0x200000 {
 		freeBase = 0x200000
 	}
+	freeBase &= ^uint64(0xFFF)
 	if freeBase < top {
-		out = append(out, memDesc{typ: 7, start: freeBase, pages: (top - freeBase) / 4096})
-	}
-	if fbBase != 0 && fbSize != 0 {
-		out = append(out, memDesc{typ: 11, start: fbBase &^ 0xFFF, pages: (fbSize + 0xFFF) / 4096, attr: 0x1})
+		emitMinus(freeBase, top, 7)
 	}
 	return out
 }
@@ -746,7 +885,7 @@ func svcOpenProtoInfo(state *cpu.CPUState, ram *mmu.RAM) error {
 		state.Regs[cpu.RAX] = EFIStatusOutOfResources
 		return nil
 	}
-	_ = ram.Write64(entry + 16, 0x00000006) // Attributes+OpenCount packed
+	_ = ram.Write64(entry+16, 0x00000006) // Attributes+OpenCount packed
 	_ = ram.Write64(bufPtr, entry)
 	_ = ram.Write64(countPtr, 1)
 	state.Regs[cpu.RAX] = EFIStatusSuccess
@@ -1076,7 +1215,7 @@ func readUCS2Name(ram *mmu.RAM, addr uint64) (string, bool) {
 		}
 		u16 = append(u16, ch)
 	}
-	if len(u16) == 0 && len(u16) >= 512 {
+	if len(u16) == 0 || len(u16) >= 512 {
 		return "", false
 	}
 	runes := make([]rune, 0, len(u16))
@@ -1421,6 +1560,38 @@ func DispatchServices(state *cpu.CPUState, ram *mmu.RAM, ps2 *devices.PS2Control
 		return true, do_svcSetVariable(state, ram)
 	case svcResetSystem:
 		return true, do_svcResetSystem(state, ram)
+	case svcBlockReset, svcBlockFlush, svcFileClose, svcFileFlush:
+		state.Regs[cpu.RAX] = EFIStatusSuccess
+		return true, nil
+	case svcBlockRead:
+		return true, doBlockRead(state, ram)
+	case svcBlockWrite:
+		return true, doBlockWrite(state, ram)
+	case svcFSOpenVolume:
+		return true, doFSOpenVolume(state, ram)
+	case svcFileOpen:
+		return true, doFileOpen(state, ram)
+	case svcFileRead:
+		return true, doFileRead(state, ram)
+	case svcFileGetPos:
+		return true, doFileGetPos(state, ram)
+	case svcFileSetPos:
+		return true, doFileSetPos(state, ram)
+	case svcFileGetInfo:
+		return true, doFileGetInfo(state, ram)
+	case svcFileWrite:
+		state.Regs[cpu.RAX] = EFIStatusWriteProtected
+		return true, nil
+	case svcLoadImage:
+		return true, doLoadImage(state, ram)
+	case svcStartImage:
+		return true, doStartImage(state, ram)
+	case svcUnloadImage:
+		delete(fwState.images, state.Regs[cpu.RCX])
+		state.Regs[cpu.RAX] = EFIStatusSuccess
+		return true, nil
+	case svcLocateDevicePath:
+		return true, doLocateDevicePath(state, ram)
 	}
 	return false, nil
 }

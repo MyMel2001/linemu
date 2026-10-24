@@ -23,8 +23,8 @@ const (
 )
 
 const (
-	EFISystemTableSignature    = 0x5453595320494249 // "IBI SYST"
-	EFIBootServicesSignature   = 0x56524553544f4f42 // "BOOTSERV"
+	EFISystemTableSignature     = 0x5453595320494249 // "IBI SYST"
+	EFIBootServicesSignature    = 0x56524553544f4f42 // "BOOTSERV"
 	EFIRuntimeServicesSignature = 0x5652455354554e52 // "RUNTSERV"
 
 	SystemTableBaseAddr     uint64 = 0x100000 // 1MB mark
@@ -131,10 +131,15 @@ func SetupEFITables(ram *mmu.RAM, payloadBase uint64, fbBase uint64, fbWidth, fb
 		return err
 	}
 
-	// 6. Loaded Image Protocol at LoadedImageBaseAddr
-	_ = ram.Write32(LoadedImageBaseAddr, 0x00010000)     // Revision
-	_ = ram.Write64(LoadedImageBaseAddr+32, payloadBase) // ImageBase
-	_ = ram.Write64(LoadedImageBaseAddr+40, 1024*1024)   // ImageSize dummy
+	// 6. EFI_LOADED_IMAGE_PROTOCOL (80B struct, UEFI 2.10 layout)
+	_ = ram.Write32(LoadedImageBaseAddr+0, 0x00010000) // Revision
+	_ = ram.Write64(LoadedImageBaseAddr+8, 0)          // ParentHandle (none)
+	_ = ram.Write64(LoadedImageBaseAddr+16, SystemTableBaseAddr)
+	_ = ram.Write64(LoadedImageBaseAddr+24, HandleBootVol) // DeviceHandle
+	_ = ram.Write64(LoadedImageBaseAddr+32, DevicePathAddr)
+	_ = ram.Write64(LoadedImageBaseAddr+56, 0) // Reserved
+	_ = ram.Write64(LoadedImageBaseAddr+64, payloadBase)
+	_ = ram.Write64(LoadedImageBaseAddr+72, 1024*1024) // patched by BootUEFI
 
 	// 7. Point protocol-dispatch services and ConOut members at hypercall stubs
 	SetupProtocolOverrides(ram)
@@ -340,6 +345,100 @@ func extractFATPayload(dev devices.BlockStorage, startLBA uint64) ([]byte, error
 	return nil, fmt.Errorf("EFI binary not found in FAT")
 }
 
+// loadPESections maps PE sections at imageBase; returns entry, footprint end, PE size.
+func loadPESections(ram *mmu.RAM, payload []byte, imageBase uint64) (entry, end, peSize uint64, err error) {
+	peFile, err := pe.NewFile(bytes.NewReader(payload))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer peFile.Close()
+	var ep uint32
+	switch opt := peFile.OptionalHeader.(type) {
+	case *pe.OptionalHeader64:
+		ep = opt.AddressOfEntryPoint
+		peSize = uint64(opt.SizeOfImage)
+	case *pe.OptionalHeader32:
+		ep = opt.AddressOfEntryPoint
+		peSize = uint64(opt.SizeOfImage)
+	}
+	for _, sec := range peFile.Sections {
+		data, err := sec.Data()
+		if err != nil {
+			continue
+		}
+		_ = ram.LoadBytes(imageBase+uint64(sec.VirtualAddress), data)
+		if e := uint64(sec.VirtualAddress) + uint64(sec.VirtualSize); e > end {
+			end = e
+		}
+		if e := uint64(sec.VirtualAddress) + uint64(len(data)); e > end {
+			end = e
+		}
+	}
+	return imageBase + uint64(ep), imageBase + end, peSize, nil
+}
+
+// findBootFATStart returns the FAT LBA used for the boot payload (GPT/MBR/ElTorito/raw).
+func findBootFATStart(dev devices.BlockStorage) uint64 {
+	var gptHeader [512]byte
+	if err := dev.ReadSector(1, gptHeader[:]); err == nil && string(gptHeader[0:8]) == "EFI PART" {
+		partLBA := binary.LittleEndian.Uint64(gptHeader[72:80])
+		numParts := binary.LittleEndian.Uint32(gptHeader[80:84])
+		partSize := binary.LittleEndian.Uint32(gptHeader[84:88])
+		if partSize >= 128 && numParts > 0 && partLBA > 0 {
+			espGUID := []byte{0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B}
+			var entryBuf [512]byte
+			curSec := uint64(^uint64(0))
+			for i := uint32(0); i < numParts && i < 16; i++ {
+				secOffset := (i * partSize) % 512
+				secIndex := partLBA + uint64((i*partSize)/512)
+				if secIndex != curSec {
+					curSec = secIndex
+					_ = dev.ReadSector(curSec, entryBuf[:])
+				}
+				if bytes.Equal(entryBuf[secOffset:secOffset+16], espGUID) {
+					return binary.LittleEndian.Uint64(entryBuf[secOffset+32 : secOffset+40])
+				}
+			}
+		}
+	}
+	var mbr [512]byte
+	if err := dev.ReadSector(0, mbr[:]); err == nil && mbr[510] == 0x55 && mbr[511] == 0xAA {
+		for i := 0; i < 4; i++ {
+			entryOffset := 446 + (i * 16)
+			pType := mbr[entryOffset+4]
+			if pType == 0xEF || pType == 0x0B || pType == 0x0C || pType == 0x06 || pType == 0x0E {
+				if startLBA := uint64(binary.LittleEndian.Uint32(mbr[entryOffset+8 : entryOffset+12])); startLBA > 0 {
+					return startLBA
+				}
+			}
+		}
+	}
+	var isoBootRec [512]byte
+	for _, lba := range []uint64{68, 17} {
+		if err := dev.ReadSector(lba, isoBootRec[:]); err == nil &&
+			bytes.Contains(isoBootRec[:], []byte("EL TORITO SPECIFICATION")) {
+			catLBA := uint64(binary.LittleEndian.Uint32(isoBootRec[71:75]))
+			if catLBA > 0 {
+				// Boot catalog LBA is in 2048-byte ISO sectors; convert to 512-byte sectors.
+				catalogSector := catLBA * 4
+				var cat [512]byte
+				if err := dev.ReadSector(catalogSector, cat[:]); err == nil {
+					// Entry 0 is the validation entry; boot entries start at offset 32.
+					// Boot entry: byte0=0x88 bootable, bytes 8..12=Load RBA (ISO sectors).
+					for offset := 32; offset < 512; offset += 32 {
+						if cat[offset] == 0x88 {
+							if loadLBA := uint64(binary.LittleEndian.Uint32(cat[offset+8 : offset+12])); loadLBA > 0 {
+								return loadLBA * 4
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // LoadEFIPayload parses and maps PE32+ executable sections into guest physical RAM
 func LoadEFIPayload(ram *mmu.RAM, state *cpu.CPUState, payload []byte) (uint64, error) {
 	if len(payload) == 0 {
@@ -394,13 +493,47 @@ func BootUEFI(ram *mmu.RAM, c *cpu.CPUState, dev devices.BlockStorage, fbBase ui
 		return 0, err
 	}
 
-	entryPoint, err := LoadEFIPayload(ram, c, payload)
-	if err != nil {
-		return 0, fmt.Errorf("failed loading EFI payload: %w", err)
+	// Resolve image base/entry early so tables carry the real ImageBase.
+	imageBase := uint64(DefaultPayloadBase)
+	if peFile, perr := pe.NewFile(bytes.NewReader(payload)); perr == nil {
+		switch opt := peFile.OptionalHeader.(type) {
+		case *pe.OptionalHeader64:
+			if opt.ImageBase != 0 {
+				imageBase = opt.ImageBase
+			}
+		case *pe.OptionalHeader32:
+			if opt.ImageBase != 0 {
+				imageBase = uint64(opt.ImageBase)
+			}
+		}
+		peFile.Close()
 	}
 
-	if err := SetupEFITables(ram, DefaultPayloadBase, fbBase, fbWidth, fbHeight); err != nil {
+	if err := SetupEFITables(ram, imageBase, fbBase, fbWidth, fbHeight); err != nil {
 		return 0, fmt.Errorf("failed configuring EFI tables: %w", err)
+	}
+
+	entryPoint, end, _, err := loadPESections(ram, payload, imageBase)
+	if err != nil {
+		// Fallback: raw executable / test binary loaded directly at imageBase
+		// ponytail: load unformatted binary image at resolved base
+		if err := ram.LoadBytes(imageBase, payload); err != nil {
+			return 0, err
+		}
+		end = imageBase + uint64(len(payload))
+		entryPoint = imageBase
+	}
+
+	// Patch Loaded Image size/partition and BlockIo media with real values.
+	imgSize := uint64(len(payload))
+	if end > imageBase && end-imageBase > imgSize {
+		imgSize = end - imageBase
+	}
+	_ = ram.Write64(LoadedImageBaseAddr+72, imgSize)
+	fatLBA := findBootFATStart(dev)
+	SetBootDevice(dev, fatLBA)
+	if dev != nil {
+		_ = ram.Write64(BlockIoMediaAddr+24, dev.TotalSectors())
 	}
 
 	// UEFI x86_64 Calling Convention:

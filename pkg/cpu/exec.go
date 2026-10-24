@@ -258,7 +258,7 @@ func shiftAlu(c *CPUState, kind int, a uint64, count uint64, w int) uint64 {
 		case 0, 2, 4, 6: // OF = MSB(result) XOR CF
 			of = (a&msb != 0) != cf
 		case 1: // ROR: XOR of two top result bits
-			of = ((a>>(bitsN-1))&1) != ((a>>(bitsN-2))&1)
+			of = ((a >> (bitsN - 1)) & 1) != ((a >> (bitsN - 2)) & 1)
 		case 3: // RCR
 			of = (a&msb != 0) != cf
 		case 5: // SHR: original MSB
@@ -307,14 +307,14 @@ type decoder struct {
 	rip   uint64
 	start uint64
 
-	rex    bool
-	rexW   bool
-	rexR   bool
-	rexX   bool
-	rexB   bool
-	op66   bool
-	opF2   bool
-	opF3   bool
+	rex  bool
+	rexW bool
+	rexR bool
+	rexX bool
+	rexB bool
+	op66 bool
+	opF2 bool
+	opF3 bool
 }
 
 func (d *decoder) fetch8() (uint8, error) {
@@ -579,6 +579,47 @@ func (d *decoder) pop(w int) (uint64, error) {
 	return v, nil
 }
 
+// raiseInterrupt dispatches software INT via the 64-bit IDT gate.
+// Stack frame matches IRETQ below: RFLAGS, CS (discarded), return RIP.
+// ponytail: CPL/DPL checks + error-code pushes skipped; add when guests need ring protection
+func (d *decoder) raiseInterrupt(vec uint8) error {
+	c := d.c
+	off := uint64(vec) * 16
+	if off+15 > c.IDTRLimit {
+		if vec == 0x29 {
+			return fmt.Errorf("guest __fastfail (INT 0x29) code=0x%x at rip=0x%x", uint32(c.Regs[RCX]), d.start)
+		}
+		return fmt.Errorf("INT 0x%02X with no IDT gate (IDTR limit=0x%x) at rip=0x%x", vec, c.IDTRLimit, d.start)
+	}
+	b, err := d.readBytes(c.IDTRBase+off, 16)
+	if err != nil {
+		return err
+	}
+	if b[5]&0x80 == 0 {
+		if vec == 0x29 {
+			return fmt.Errorf("guest __fastfail (INT 0x29) code=0x%x at rip=0x%x", uint32(c.Regs[RCX]), d.start)
+		}
+		return fmt.Errorf("INT 0x%02X: IDT gate not present at rip=0x%x", vec, d.start)
+	}
+	target := uint64(b[0]) | uint64(b[1])<<8 | uint64(b[6])<<16 |
+		uint64(b[7])<<24 | uint64(b[8])<<32 | uint64(b[9])<<40 |
+		uint64(b[10])<<48 | uint64(b[11])<<56
+	if err := d.push(c.RFLAGS, 8); err != nil {
+		return err
+	}
+	if err := d.push(0, 8); err != nil { // CS discarded (segments not modeled)
+		return err
+	}
+	if err := d.push(d.rip, 8); err != nil {
+		return err
+	}
+	if b[5]&0x0F == 0x0E { // interrupt gate clears IF; trap gate leaves it
+		c.RFLAGS &^= FLAG_IF
+	}
+	d.rip = target
+	return nil
+}
+
 // ---------- string operations ----------
 
 func (d *decoder) countRCX() uint64 {
@@ -718,6 +759,63 @@ func (d *decoder) stringIter(op byte, w int, step uint64) error {
 
 // ---------- CPUID / timers / MSRs ----------
 
+// CR0 bits.
+const (
+	CR0PE = 1 << 0
+	CR0PG = uint64(1) << 31
+)
+
+// walker reads guest-physical memory without translation (page tables live
+// in physical RAM; routing them through Translate would recurse).
+type physMem interface {
+	Read8(addr uint64) (uint8, error)
+	Read64(addr uint64) (uint64, error)
+}
+
+// PagingEnabled reports whether the guest turned on long-mode paging.
+func (c *CPUState) PagingEnabled() bool { return c.CR0&CR0PG != 0 }
+
+// Translate walks the guest 4-level tables (CR3 = PML4 base) for addr.
+// Returns (phys, true) on success; (0, false) when paging is off or the
+// entry is not present. 2MB/1GB large pages handled; NX/XD ignored.
+func (c *CPUState) Translate(addr uint64, mem physMem) (uint64, bool) {
+	if c.CR3 == 0 {
+		return addr, true // identity until guest loads CR3
+	}
+	pml4 := c.CR3 & ^uint64(0xFFF)
+	entry := func(table, idx uint64) (uint64, bool) {
+		v, err := mem.Read64(table + idx*8)
+		if err != nil || v&1 == 0 {
+			return 0, false
+		}
+		return v, true
+	}
+	pml4e, ok := entry(pml4, (addr>>39)&0x1FF)
+	if !ok {
+		return 0, false
+	}
+	// PML4 entries never map a page directly; they point at the PDPT.
+	pdp, ok := entry(pml4e&^uint64(0xFFF), (addr>>30)&0x1FF)
+	if !ok {
+		return 0, false
+	}
+	if pdp&(1<<7) != 0 { // 1GB page (PDPT-level large page)
+		return (pdp & ^uint64(0x3FFFFFFF)) | (addr & 0x3FFFFFFF), true
+	}
+	pde, ok := entry(pdp&^uint64(0xFFF), (addr>>21)&0x1FF)
+	if !ok {
+		return 0, false
+	}
+	if pde&(1<<7) != 0 { // 2MB page (PDE-level large page)
+		return (pde & ^uint64(0x1FFFFF)) | (addr & 0x1FFFFF), true
+	}
+	pte, ok := entry(pde&^uint64(0xFFF), (addr>>12)&0x1FF)
+	if !ok {
+		return 0, false
+	}
+	return (pte & ^uint64(0xFFF)) | (addr & 0xFFF), true
+}
+
 func execCPUID(c *CPUState) {
 	leaf := uint32(c.Regs[RAX])
 	var eax, ebx, ecx, edx uint32
@@ -736,7 +834,7 @@ func execCPUID(c *CPUState) {
 	case 0x80000000:
 		eax = 0x80000001
 	case 0x80000001:
-		ecx = 1 // LAHF/SAHF
+		ecx = 1                     // LAHF/SAHF
 		edx = 1<<20 | 1<<27 | 1<<29 // NX, RDTSCP, LM
 	case 0x80000008:
 		ecx = 48<<8 | 36
@@ -772,12 +870,95 @@ func (c *CPUState) Step(mem Memory, io IOBus) error {
 	if c.Halted {
 		return nil
 	}
-	d := &decoder{c: c, mem: mem, io: io, rip: c.RIP, start: c.RIP}
+	d := &decoder{c: c, mem: &virtMem{cpu: c, mem: mem}, io: io, rip: c.RIP, start: c.RIP}
 	if err := d.decodeExec(); err != nil {
 		return err
 	}
 	c.RIP = d.rip
 	return nil
+}
+
+// virtMem routes every guest access (fetch + data) through the CR3 page
+// tables once paging is enabled; identity before CR0.PG/CR3.
+type virtMem struct {
+	cpu *CPUState
+	mem Memory
+}
+
+func (m *virtMem) phys(addr uint64) (uint64, error) {
+	if !m.cpu.PagingEnabled() {
+		return addr, nil
+	}
+	p, ok := m.cpu.Translate(addr, m.mem)
+	if !ok {
+		m.cpu.CR2 = addr
+		return 0, fmt.Errorf("page fault: 0x%x", addr)
+	}
+	return p, nil
+}
+
+func (m *virtMem) Read8(addr uint64) (uint8, error) {
+	p, err := m.phys(addr)
+	if err != nil {
+		return 0, err
+	}
+	return m.mem.Read8(p)
+}
+
+func (m *virtMem) Read16(addr uint64) (uint16, error) {
+	p, err := m.phys(addr)
+	if err != nil {
+		return 0, err
+	}
+	return m.mem.Read16(p)
+}
+
+func (m *virtMem) Read32(addr uint64) (uint32, error) {
+	p, err := m.phys(addr)
+	if err != nil {
+		return 0, err
+	}
+	return m.mem.Read32(p)
+}
+
+func (m *virtMem) Read64(addr uint64) (uint64, error) {
+	p, err := m.phys(addr)
+	if err != nil {
+		return 0, err
+	}
+	return m.mem.Read64(p)
+}
+
+func (m *virtMem) Write8(addr uint64, val uint8) error {
+	p, err := m.phys(addr)
+	if err != nil {
+		return err
+	}
+	return m.mem.Write8(p, val)
+}
+
+func (m *virtMem) Write16(addr uint64, val uint16) error {
+	p, err := m.phys(addr)
+	if err != nil {
+		return err
+	}
+	return m.mem.Write16(p, val)
+}
+
+func (m *virtMem) Write32(addr uint64, val uint32) error {
+	p, err := m.phys(addr)
+	if err != nil {
+		return err
+	}
+	return m.mem.Write32(p, val)
+}
+
+func (m *virtMem) Write64(addr uint64, val uint64) error {
+	p, err := m.phys(addr)
+	if err != nil {
+		return err
+	}
+	return m.mem.Write64(p, val)
 }
 
 func (d *decoder) decodeExec() error {
@@ -1166,6 +1347,31 @@ func (d *decoder) execOp(op byte) error {
 		}
 		d.rip = v
 		return nil
+	case op == 0xCB: // RETF: pop RIP, discard CS selector (segments not modeled)
+		v, err := d.pop(8)
+		if err != nil {
+			return err
+		}
+		if _, err := d.pop(8); err != nil {
+			return err
+		}
+		d.rip = v
+		return nil
+	case op == 0xCA: // RETF imm16
+		imm, err := d.fetchN(2)
+		if err != nil {
+			return err
+		}
+		v, err := d.pop(8)
+		if err != nil {
+			return err
+		}
+		if _, err := d.pop(8); err != nil {
+			return err
+		}
+		d.c.Regs[RSP] += imm
+		d.rip = v
+		return nil
 
 	// MOV r/m, imm
 	case op == 0xC6 || op == 0xC7:
@@ -1177,9 +1383,12 @@ func (d *decoder) execOp(op byte) error {
 		if err != nil {
 			return err
 		}
-		ib := 4
-		if w == 2 {
-			ib = 2
+		ib := 1 // C6 imm8 is always 1 byte
+		if op == 0xC7 {
+			ib = 4
+			if w == 2 {
+				ib = 2
+			}
 		}
 		imm, err := d.fetchImm(ib, w == 8)
 		if err != nil {
@@ -1387,14 +1596,29 @@ func (d *decoder) execOp(op byte) error {
 	case op >= 0xD8 && op <= 0xDF: // x87 FPU
 		return d.execX87(op)
 
-	case op == 0xCD: // INT imm8 — no BIOS/IDT services implemented
+	case op == 0xCD: // INT imm8 — dispatch via IDT gate
 		imm, err := d.fetch8()
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("software interrupt INT 0x%02X not implemented at rip=0x%x", imm, d.start)
-	case op == 0xCC:
-		return fmt.Errorf("INT3 breakpoint at rip=0x%x", d.start)
+		return d.raiseInterrupt(imm)
+	case op == 0xCC: // INT3 — vector 3 via IDT
+		return d.raiseInterrupt(3)
+	case op == 0xCF: // IRETQ — pop RIP, CS, RFLAGS
+		rip, err := d.pop(8)
+		if err != nil {
+			return err
+		}
+		if _, err := d.pop(8); err != nil { // CS discarded (segments not modeled)
+			return err
+		}
+		flags, err := d.pop(8)
+		if err != nil {
+			return err
+		}
+		d.c.RFLAGS = flags | 0x2
+		d.rip = rip
+		return nil
 	}
 
 	return fmt.Errorf("unsupported opcode: 0x%02X at rip=0x%x", op, d.start)
@@ -1764,7 +1988,7 @@ func (d *decoder) execDiv(src uint64, w int, signed bool) error {
 	qv := q.Uint64()
 	rv := r.Uint64()
 	if w == 1 {
-		return d.writeRM(&raxRef, 2, ((rv & 0xFF) << 8) | (qv & 0xFF))
+		return d.writeRM(&raxRef, 2, ((rv&0xFF)<<8)|(qv&0xFF))
 	}
 	if err := d.writeRM(&raxRef, w, qv); err != nil {
 		return err
@@ -1880,8 +2104,8 @@ func (d *decoder) execTwoByte() error {
 		}
 		d.finish(&r)
 		return nil
-	case op == 0x20 || op == 0x21: // MOV r64, CRn/DRn
-		_, regRaw, regRef, r, err := d.parseRM(8)
+	case op == 0x20 || op == 0x21: // MOV r64, CRn/DRn (reg=CR#, rm=dest GPR)
+		_, regRaw, _, r, err := d.parseRM(8)
 		if err != nil {
 			return err
 		}
@@ -1890,7 +2114,11 @@ func (d *decoder) execTwoByte() error {
 		}
 		var v uint64
 		if op == 0x20 {
-			switch regRaw {
+			crNum := regRaw
+			if d.rexR {
+				crNum += 8
+			}
+			switch crNum {
 			case 0:
 				v = c.CR0
 			case 2:
@@ -1901,10 +2129,10 @@ func (d *decoder) execTwoByte() error {
 				v = c.CR4
 			}
 		}
-		c.Regs[regRef.idx] = v
+		c.Regs[r.idx] = v
 		return nil
-	case op == 0x22 || op == 0x23: // MOV CRn/DRn, r64
-		_, regRaw, regRef, r, err := d.parseRM(8)
+	case op == 0x22 || op == 0x23: // MOV CRn/DRn, r64 (reg=CR#, rm=src GPR)
+		_, regRaw, _, r, err := d.parseRM(8)
 		if err != nil {
 			return err
 		}
@@ -1912,8 +2140,12 @@ func (d *decoder) execTwoByte() error {
 			return fmt.Errorf("invalid CR/DR move at rip=0x%x", d.start)
 		}
 		if op == 0x22 {
-			v := c.Regs[regRef.idx]
-			switch regRaw {
+			v := c.Regs[r.idx]
+			crNum := regRaw
+			if d.rexR {
+				crNum += 8
+			}
+			switch crNum {
 			case 0:
 				c.CR0 = v
 			case 2:

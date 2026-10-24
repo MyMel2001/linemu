@@ -31,6 +31,29 @@ const (
 	TextOutGUIDAddr  uint64 = 0x101500
 	TextInGUIDAddr   uint64 = 0x101510
 	LoadedImgGUIDAdr uint64 = 0x101520
+	DevicePathGUIDAd uint64 = 0x101530
+	BlockIoGUIDAddr  uint64 = 0x101540
+	SimpleFSGUIDAddr uint64 = 0x101550
+	FileProtoGUIDAd  uint64 = 0x101560
+	DevicePathAddr   uint64 = 0x101900 // 4B end node
+	BlockIoAddr      uint64 = 0x101910 // EFI_BLOCK_IO_PROTOCOL (48B, ends 0x101940)
+	BlockIoMediaAddr uint64 = 0x101940 // EFI_BLOCK_IO_MEDIA (32B, ends 0x101960)
+	SimpleFSAddr     uint64 = 0x101960 // EFI_SIMPLE_FILE_SYSTEM_PROTOCOL (16B, ends 0x101970)
+	FileRootAddr     uint64 = 0x101970 // EFI_FILE_PROTOCOL root (88B, ends 0x1019C8)
+	// Protocol-member stubs (13B each, 16B spacing) before firmware cells.
+	stubBlockReset   uint64 = 0x1019D0
+	stubBlockRead    uint64 = 0x1019E0
+	stubBlockWrite   uint64 = 0x1019F0
+	stubBlockFlush   uint64 = 0x101A00
+	stubFSOpenVolume uint64 = 0x101A10
+	stubFileOpen     uint64 = 0x101A20
+	stubFileClose    uint64 = 0x101A30
+	stubFileRead     uint64 = 0x101A40
+	stubFileWrite    uint64 = 0x101A50
+	stubFileGetInfo  uint64 = 0x101A60
+	stubFileSetPos   uint64 = 0x101A70
+	stubFileGetPos   uint64 = 0x101A80
+	stubFileFlush    uint64 = 0x101A90
 	StubBase         uint64 = 0x101600
 
 	GOPModeInfoBase uint64 = 0x101800 // 4 x 36B MODE_INFO entries (ends 0x101890)
@@ -82,7 +105,7 @@ const (
 
 // Hypercall service ids (SYSCALL with RAX in this range)
 const (
-	EFIHypercallBase = 0xE0000000
+	EFIHypercallBase  = 0xE0000000
 	svcHandleProtocol = EFIHypercallBase + 1
 	svcOpenProtocol   = EFIHypercallBase + 2
 	svcLocateProtocol = EFIHypercallBase + 3
@@ -120,6 +143,18 @@ var (
 		0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
 	loadedImgGUID = [16]byte{0xA1, 0x31, 0x1B, 0x5B, 0x62, 0x95, 0xD2, 0x11,
 		0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
+	// 09576E91-6D3F-11D2-8E39-00A0C969723B Device Path
+	devicePathGUID = [16]byte{0x91, 0x6E, 0x57, 0x09, 0x3F, 0x6D, 0xD2, 0x11,
+		0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
+	// 964E5B21-6459-11D2-8E39-00A0C969723B Block I/O
+	blockIoGUID = [16]byte{0x21, 0x5B, 0x4E, 0x96, 0x59, 0x64, 0xD2, 0x11,
+		0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
+	// 964E5B22-6459-11D2-8E39-00A0C969723B Simple File System
+	simpleFSGUID = [16]byte{0x22, 0x5B, 0x4E, 0x96, 0x59, 0x64, 0xD2, 0x11,
+		0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
+	// 964E5B23-6459-11D2-8E39-00A0C969723B File Protocol (opened volumes/files)
+	fileProtoGUID = [16]byte{0x23, 0x5B, 0x4E, 0x96, 0x59, 0x64, 0xD2, 0x11,
+		0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}
 )
 
 // IsHypercall reports whether a trapped SYSCALL RAX targets an EFI service.
@@ -231,11 +266,56 @@ func SetupGOP(ram *mmu.RAM, fbBase uint64, fbWidth, fbHeight uint32) error {
 		{TextOutGUIDAddr, textOutGUID},
 		{TextInGUIDAddr, textInGUID},
 		{LoadedImgGUIDAdr, loadedImgGUID},
+		{DevicePathGUIDAd, devicePathGUID},
+		{BlockIoGUIDAddr, blockIoGUID},
+		{SimpleFSGUIDAddr, simpleFSGUID},
+		{FileProtoGUIDAd, fileProtoGUID},
 	} {
 		if err := ram.LoadBytes(g.addr, g.bytes[:]); err != nil {
 			return err
 		}
 	}
+
+	for addr, svc := range map[uint64]uint64{
+		stubBlockReset:   svcBlockReset,
+		stubBlockRead:    svcBlockRead,
+		stubBlockWrite:   svcBlockWrite,
+		stubBlockFlush:   svcBlockFlush,
+		stubFSOpenVolume: svcFSOpenVolume,
+		stubFileOpen:     svcFileOpen,
+		stubFileClose:    svcFileClose,
+		stubFileRead:     svcFileRead,
+		stubFileWrite:    svcFileWrite,
+		stubFileGetInfo:  svcFileGetInfo,
+		stubFileSetPos:   svcFileSetPos,
+		stubFileGetPos:   svcFileGetPos,
+		stubFileFlush:    svcFileFlush,
+	} {
+		if err := writeServiceStub(ram, addr, svc); err != nil {
+			return err
+		}
+	}
+
+	// Device path end node: { Type 0x7F, SubType 0xFF, Length 4 }.
+	_ = ram.LoadBytes(DevicePathAddr, []byte{0x7F, 0xFF, 0x04, 0x00})
+
+	// EFI_BLOCK_IO_PROTOCOL { Revision u64, Media*, Reset*, Read*, Write*, Flush* }.
+	_ = ram.Write64(BlockIoAddr+0, 0x00020001)
+	_ = ram.Write64(BlockIoAddr+8, BlockIoMediaAddr)
+	_ = ram.Write64(BlockIoAddr+16, stubBlockReset)
+	_ = ram.Write64(BlockIoAddr+24, stubBlockRead)
+	_ = ram.Write64(BlockIoAddr+32, stubBlockWrite)
+	_ = ram.Write64(BlockIoAddr+40, stubBlockFlush)
+
+	// EFI_BLOCK_IO_MEDIA: MediaId@0, Present@5, BlockSize@12, LastBlock@24.
+	_ = ram.Write32(BlockIoMediaAddr+0, 1)
+	_ = ram.Write8(BlockIoMediaAddr+5, 1) // MediaPresent
+	_ = ram.Write32(BlockIoMediaAddr+12, 512)
+	_ = ram.Write64(BlockIoMediaAddr+24, 0) // patched by SetBootDevice
+
+	// EFI_SIMPLE_FILE_SYSTEM_PROTOCOL { Revision u64, OpenVolume* }.
+	_ = ram.Write64(SimpleFSAddr+0, 0x00010000)
+	_ = ram.Write64(SimpleFSAddr+8, stubFSOpenVolume)
 	return nil
 }
 
@@ -292,8 +372,12 @@ func SetupProtocolOverrides(ram *mmu.RAM) {
 		152: svcHandleProtocol,
 		168: svcRegisterNotify,
 		176: svcLocateHandle,
+		184: svcLocateDevicePath,
 		192: svcInstallConfigTable,
+		200: svcLoadImage,
+		208: svcStartImage,
 		216: svcExit,
+		224: svcUnloadImage,
 		232: svcExitBootServices,
 		240: svcGetNextMono,
 		248: svcStall,
@@ -335,13 +419,13 @@ func SetupProtocolOverrides(ram *mmu.RAM) {
 	_ = ram.Write64(BootServicesBaseAddr+72, stubFreePool)
 
 	// EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL members
-	_ = ram.Write64(ConOutBaseAddr+0, stubConOutReset)   // Reset
-	_ = ram.Write64(ConOutBaseAddr+8, stubOutputString) // OutputString
-	_ = ram.Write64(ConOutBaseAddr+16, stubTestString)   // TestString
-	_ = ram.Write64(ConOutBaseAddr+24, stubConOutQuery)  // QueryMode
+	_ = ram.Write64(ConOutBaseAddr+0, stubConOutReset)    // Reset
+	_ = ram.Write64(ConOutBaseAddr+8, stubOutputString)   // OutputString
+	_ = ram.Write64(ConOutBaseAddr+16, stubTestString)    // TestString
+	_ = ram.Write64(ConOutBaseAddr+24, stubConOutQuery)   // QueryMode
 	_ = ram.Write64(ConOutBaseAddr+32, stubConOutSetMode) // SetMode
-	_ = ram.Write64(ConOutBaseAddr+40, stubSetAttribute) // SetAttribute
-	_ = ram.Write64(ConOutBaseAddr+48, stubClearScreen)  // ClearScreen
+	_ = ram.Write64(ConOutBaseAddr+40, stubSetAttribute)  // SetAttribute
+	_ = ram.Write64(ConOutBaseAddr+48, stubClearScreen)   // ClearScreen
 	_ = ram.Write64(ConOutBaseAddr+56, stubSetCursorPos)  // SetCursorPosition
 	_ = ram.Write64(ConOutBaseAddr+64, stubEnableCursor)  // EnableCursor
 	_ = ram.Write64(ConOutBaseAddr+72, ConOutModeAddr)    // Mode*
